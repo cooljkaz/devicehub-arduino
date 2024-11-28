@@ -153,6 +153,7 @@ void DeviceHub::handleEmergencyEnd() {
 }
 
 void DeviceHub::performEmergencyActions() {
+    Serial.println("Attempting emergency protocol...");
     if (emergencyAction) {
         String result = emergencyAction(JsonObject());
         sendMessage("Emergency action performed: " + result);
