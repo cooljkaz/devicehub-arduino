@@ -3,7 +3,9 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
+#include <Preferences.h>
 
+Preferences prefs;
 const IPAddress DeviceHub::BROADCAST_IP(255, 255, 255, 255);
 
 DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceName)
@@ -201,9 +203,18 @@ String DeviceHub::getDeviceInfo() {
     doc["mac"] = WiFi.macAddress();
     doc["rssi"] = WiFi.RSSI();
 
+    // Instead of an array of strings, create an array of action objects.
     JsonArray actionsArray = doc.createNestedArray("actions");
     for (const auto& actionName : actionNames) {
-        actionsArray.add(actionName);
+        JsonObject actionObj = actionsArray.createNestedObject();
+        actionObj["name"] = actionName;
+        // If allowed fields were defined for this action, add them.
+        if (allowedFieldsMap.find(actionName) != allowedFieldsMap.end()) {
+            JsonArray allowedArray = actionObj.createNestedArray("allowedFields");
+            for (const auto& field : allowedFieldsMap[actionName]) {
+                allowedArray.add(field);
+            }
+        }
     }
 
     String jsonString;
@@ -275,9 +286,30 @@ String DeviceHub::handleAction(const String& actionName, const JsonObject& paylo
     return notFoundMsg;
 }
 
+void DeviceHub::savePersistentData(const char* key, const String &value) {
+    // Open a namespace (here "device-hub") in read/write mode
+    prefs.begin("device-hub", false);
+    prefs.putString(key, value);
+    prefs.end();
+}
+
+String DeviceHub::loadPersistentData(const char* key, const String &defaultValue) {
+    prefs.begin("device-hub", false);
+    String value = prefs.getString(key, defaultValue);
+    prefs.end();
+    return value;
+}
+
+// Original registerAction (no allowed fields)
 void DeviceHub::registerAction(const String& actionName, ActionCallback callback) {
+    registerAction(actionName, callback, std::vector<String>()); // Call the overload with an empty list.
+}
+
+// New registerAction overload with allowed fields.
+void DeviceHub::registerAction(const String& actionName, ActionCallback callback, const std::vector<String>& allowedFields) {
     actions[actionName] = callback;
     actionNames.push_back(actionName);
+    allowedFieldsMap[actionName] = allowedFields;
 }
 
 void DeviceHub::registerEmergencyAction(ActionCallback callback) {

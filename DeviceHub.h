@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <map>
 #include <vector>
 #include "OtaHelper.h"
@@ -22,10 +23,18 @@ public:
     void begin();
     void loop();
     
+    // Register an action without allowed fields (legacy)
     void registerAction(const String& actionName, ActionCallback callback);
+    // Register an action with allowed data fields
+    void registerAction(const String& actionName, ActionCallback callback, const std::vector<String>& allowedFields);
+    
     void registerEmergencyAction(ActionCallback callback);
     void registerResetAction(ActionCallback callback);
     void sendMessage(const String& message, const String& type = "device_message");
+
+    // Persistent data methods
+    void savePersistentData(const char* key, const String& value);
+    String loadPersistentData(const char* key, const String& defaultValue = "");
 
 private:
     static const uint16_t LOCAL_PORT = 8888;
@@ -44,6 +53,9 @@ private:
 
     std::map<String, ActionCallback> actions;
     std::vector<String> actionNames;
+    // Map to store allowed fields for each registered action
+    std::map<String, std::vector<String>> allowedFieldsMap;
+    
     ActionCallback emergencyAction;
     ActionCallback resetAction;
 
