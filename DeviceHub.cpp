@@ -235,6 +235,16 @@ void DeviceHub::sendMessage(const String& message, const String& type) {
     sendUdpMessage(jsonString);
 }
 
+
+
+void DeviceHub::sendEmergency(const String& message) {
+    udp.beginPacket(BROADCAST_IP, EMERGENCY_NOTIFICATION_PORT);
+    udp.print(message);
+    udp.endPacket();
+    
+}
+
+
 void DeviceHub::sendUdpMessage(const String& payload) {
     udp.beginPacket(BROADCAST_IP, HUB_PORT);
     udp.print(payload);

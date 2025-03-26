@@ -31,6 +31,7 @@ public:
     void registerEmergencyAction(ActionCallback callback);
     void registerResetAction(ActionCallback callback);
     void sendMessage(const String& message, const String& type = "device_message");
+    void sendEmergency(const String& message);
 
     // Persistent data methods
     void savePersistentData(const char* key, const String& value);
@@ -40,6 +41,7 @@ private:
     static const uint16_t LOCAL_PORT = 8888;
     static const uint16_t HUB_PORT = 8889;
     static const uint16_t EMERGENCY_PORT = 8890;
+    static const uint16_t EMERGENCY_NOTIFICATION_PORT = 8891;
     static const IPAddress BROADCAST_IP;  // New constant for broadcast IP
 
     const char* ssid;
@@ -83,6 +85,7 @@ private:
     void sendAck(const String& messageId);
     void sendPeriodicUpdate();
     void sendUdpMessage(const String& payload);
+    
 };
 
 #endif // DEVICEHUB_H
