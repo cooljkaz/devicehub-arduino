@@ -58,6 +58,9 @@ void setup() {
     eventSchema["pressure"] = "number";
     hub.registerEvent("environment", "Environment Data", eventSchema.as<JsonObject>());
     
+    // Register an event with no schema
+    hub.registerEvent("puzzle_solved", "Puzzle Solved");
+    
     // Register emergency action
     hub.registerEmergencyAction([](const JsonObject& payload) {
         Serial.println("Emergency action triggered!");
@@ -91,6 +94,19 @@ void loop() {
         // Emit event using v2 format
         hub.emitEvent("environment", payload.as<JsonObject>());
         lastEvent = millis();
+    }
+    
+    // Example: Emit status event every 10 seconds
+    static unsigned long lastStatusEvent = 0;
+    if (millis() - lastStatusEvent > 10000) {
+        StaticJsonDocument<256> statusPayload;
+        statusPayload["status"] = "running";
+        statusPayload["uptime"] = millis() / 1000;
+        statusPayload["free_memory"] = ESP.getFreeHeap();
+        
+        // Emit event with no predefined schema
+        hub.emitEvent("device_status", statusPayload.as<JsonObject>());
+        lastStatusEvent = millis();
     }
     
     // Example: Send emergency message if button pressed

@@ -19,7 +19,7 @@
 // CoAP ports
 #define COAP_PORT 5683
 #define SECURE_COAP_PORT 5684
-#define DEVICEDISCOVERY_PORT 8888
+#define DISCOVERY_PORT 8888
 static const uint16_t EMERGENCY_PORT = 8890;
 static const uint16_t EMERGENCY_NOTIFICATION_PORT = 8891;
 
@@ -87,8 +87,8 @@ public:
     void loop();
     
     // Action registration
-    void registerAction(const String& actionId, const String& actionName, ActionCallback callback);
     void registerAction(const String& actionId, ActionCallback callback);
+    void registerAction(const String& actionId, const String& actionName, ActionCallback callback);
     void registerAction(const String& actionId, const String& actionName, ActionCallback callback, const std::vector<ActionParameter>& parameters);
     
     // Event registration and emission
@@ -118,7 +118,6 @@ public:
     void sendMessage(const String& message, const String& type = "message");
     void sendEmergency(const String& message);
     void sendEmergencyResponse(const char* message);
-    void sendDeviceInfo();
 
     // Debug methods
     void enableDebug(HardwareSerial& serial);
@@ -149,8 +148,12 @@ private:
     bool debugEnabled;
 
     WiFiUDP udp;
+    WiFiUDP discoveryUdp;
+    WiFiUDP emergencyUdp;
+
     Coap *coap;
     Coap *secureCoap;
+    
 
     std::map<String, Action> actions;
     std::map<String, Event> events;
@@ -178,6 +181,11 @@ private:
     void sendUdpMessage(const String& payload);
 
     void connectWiFi();
+
+    void handleIncomingPacket();
+    void sendDeviceInfo();
+
+    void handleEmergencyPacket();
     void handleEmergencyStart();
     void handleEmergencyEnd();
 };

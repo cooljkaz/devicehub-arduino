@@ -43,18 +43,18 @@ void DeviceHub::begin(HardwareSerial& serial) {
     
     connectWiFi();
     
-    // --- Revert UDP Begin --- 
-    /*
-    log("Explicitly starting UDP listener on port %d...", COAP_PORT);
-    if (!udp.begin(COAP_PORT)) { 
-        log("Error: Failed to bind main UDP socket on port %d!", COAP_PORT);
-        return; 
+    if (discoveryUdp.begin(DISCOVERY_PORT)) {
+        Serial.printf("UDP socket bound to port %d\n", DISCOVERY_PORT);
     } else {
-        log("Main UDP socket successfully bound to port %d.", COAP_PORT);
+        Serial.println("Failed to bind UDP socket");
     }
-    */
-    // ------------------------
 
+    if (emergencyUdp.begin(EMERGENCY_PORT)) {
+        Serial.printf("Emergency UDP socket bound to port %d\n", EMERGENCY_PORT);
+    } else {
+        Serial.println("Failed to bind emergency UDP socket");
+    }
+    
     // Initialize CoAP server
     log("Creating CoAP instance...");
     coap = new Coap(udp, 1500);
@@ -132,8 +132,8 @@ void DeviceHub::loop() {
          log("Warning: dtlsEnabled but secureCoap instance is null in loop.");
     }
     
-    // --- Temporarily comment out other loop tasks --- 
     
+    handleEmergencyPacket();
     resendPendingMessages();
     sendPeriodicUpdate(); // This calls sendDeviceInfo
     otaHelper.handle();
@@ -217,7 +217,7 @@ void DeviceHub::notifyObservers(const String& eventId, const JsonObject& payload
             StaticJsonDocument<1024> doc;
             doc["event"] = eventId;
             doc["payload"] = payload;
-            doc["timestamp"] = millis();
+                doc["timestamp"] = millis();
             String output;
             serializeJson(doc, output);
             coap->sendResponse(observer.ip, observer.port, 0, output.c_str());
@@ -264,12 +264,45 @@ bool DeviceHub::isVersionSupported(const String& version) {
     return version == DEVICEHUB_VERSION_2;
 }
 
+
+
+void DeviceHub::handleIncomingPacket() {
+    int packetSize = discoveryUdp.parsePacket();
+    if (packetSize) {
+        char incomingPacket[255];
+        int len = discoveryUdp.read(incomingPacket, 255);
+        if (len > 0) {
+            incomingPacket[len] = 0;
+        }
+        Serial.printf("UDP packet received from %s:%d - %s\n", discoveryUdp.remoteIP().toString().c_str(), discoveryUdp.remotePort(), incomingPacket);
+
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, incomingPacket);
+        if (error) {
+            Serial.print(F("deserializeJson() failed: "));
+            Serial.println(error.f_str());
+            return;
+        }
+
+        if (doc.containsKey("type")) {
+            String messageType = doc["type"].as<String>();
+
+            if (messageType == "REQUEST_DEVICE_INFO") {
+                log("Received REQUEST_DEVICE_INFO");
+                sendDeviceInfo();
+            }
+        } else {
+            Serial.println("Received message without type field");
+        }
+    }
+}
+
 String DeviceHub::getDeviceInfo() {
     log("Generating full device info...");
     
     // Use a larger document size temporarily to measure the full potential size
     // We won't serialize from this if it's too big for the CoAP buffer.
-    StaticJsonDocument<2048> doc; 
+    StaticJsonDocument<2048> doc;
     
     doc["type"] = "device_info";
     doc["version"] = API_VERSION;
@@ -305,9 +338,9 @@ String DeviceHub::getDeviceInfo() {
         eventObj["id"] = event.id;
         eventObj["name"] = event.name;
         // Re-enable schema
-        eventObj["dataSchema"] = event.dataSchema; 
+        eventObj["dataSchema"] = event.dataSchema;
     }
-    
+
     JsonObject status = doc.createNestedObject("status");
     switch (currentState) {
         case DeviceState::Normal: status["state"] = "normal"; break;
@@ -329,7 +362,7 @@ String DeviceHub::getDeviceInfo() {
     String jsonString;
     if (estimatedTotalPacketSize <= COAP_BUFFER_LIMIT) {
         // Safe to serialize and return the full info
-        serializeJson(doc, jsonString);
+    serializeJson(doc, jsonString);
         log("Full device info fits within CoAP buffer (%d bytes).", COAP_BUFFER_LIMIT);
     } else {
         // Payload too large, generate a minimal truncated message
@@ -389,7 +422,7 @@ void DeviceHub::sendMessage(const String& message, const String& type) {
     doc["deviceName"] = deviceName;
     doc["message"] = message;
     doc["uuid"] = deviceUUID;
-    
+
     String jsonString;
     serializeJson(doc, jsonString);
     
@@ -479,11 +512,11 @@ String DeviceHub::loadPersistentData(const char* key, const String& defaultValue
     return value;
 }
 
-void DeviceHub::registerEvent(const String& eventId, const String& eventName, const JsonObject& dataSchema) {
+void DeviceHub::registerEvent(const String& eventId, const String& eventName, const JsonObject& schema) {
     Event event;
     event.id = eventId;
     event.name = eventName;
-    event.dataSchema = dataSchema;
+    event.dataSchema = schema;
     events[eventId] = event;
 }
 
@@ -600,6 +633,32 @@ void DeviceHub::connectWiFi() {
     } else {
         log("\nFailed to connect to WiFi after %d attempts.", attempts);
         // Handle connection failure? Maybe retry later or enter an error state?
+    }
+}
+
+void DeviceHub::handleEmergencyPacket() {
+    int packetSize = emergencyUdp.parsePacket();
+    if (packetSize) {
+        char incomingPacket[255];
+        int len = emergencyUdp.read(incomingPacket, 255);
+        if (len > 0) {
+            incomingPacket[len] = 0;
+        }
+        Serial.printf("Emergency UDP packet received from %s:%d - %s\n", emergencyUdp.remoteIP().toString().c_str(), emergencyUdp.remotePort(), incomingPacket);
+
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, incomingPacket);
+        if (error) {
+            Serial.print(F("deserializeJson() failed: "));
+            Serial.println(error.f_str());
+            return;
+        }
+
+        if (doc["type"] == "emergency_action") {
+            handleEmergencyStart();
+        } else if (doc["type"] == "emergency_end") {
+            handleEmergencyEnd();
+        }
     }
 }
 
