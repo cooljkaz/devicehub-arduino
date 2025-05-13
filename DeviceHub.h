@@ -124,6 +124,8 @@ public:
     void disableDebug();
     void log(const char* format, ...);
 
+    // allow device to be discovered via mDNS using the <device name>.local domain
+    void startMDNS();               
     // Static members
     static const IPAddress BROADCAST_IP;
 
@@ -188,6 +190,10 @@ private:
     void handleEmergencyPacket();
     void handleEmergencyStart();
     void handleEmergencyEnd();
+  
+    bool mdnsRunning = false;
+    static String toMdnsHost(String); 
+
 };
 
 #endif // DEVICEHUB_H

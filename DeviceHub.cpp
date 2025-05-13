@@ -99,6 +99,38 @@ void DeviceHub::disableDebug() {
     debugSerial = nullptr;
 }
 
+// Converts "DMX Controller"  →  "dmx-controller"
+String DeviceHub::toMdnsHost(String in) {
+    in.toLowerCase();
+    in.replace(" ", "-");
+    for (size_t i = 0; i < in.length(); ++i) {
+        if (!isalnum(in[i]) && in[i] != '-') in.remove(i--, 1); // strip bad chars
+    }
+    return in;
+}
+
+void DeviceHub::startMDNS() {
+    if (mdnsRunning) return;                 // already started
+    if (WiFi.status() != WL_CONNECTED) {     // guard for early calls
+        log("mDNS not started – Wi-Fi not connected yet");
+        return;
+    }
+
+    String host = toMdnsHost(deviceName);    // "DMX Controller" → "dmx-controller"
+    if (MDNS.begin(host.c_str())) {
+        mdnsRunning = true;
+        log("mDNS responder: http://%s.local  (IP %s)",
+            host.c_str(), WiFi.localIP().toString().c_str());
+
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("ws",   "tcp", 80);
+        MDNS.addService("coap", "udp", COAP_PORT);
+        MDNS.addService("ota",  "tcp", 3232);
+    } else {
+        log("mDNS failed – name collision?");
+    }
+}
+
 void DeviceHub::log(const char* format, ...) {
     if (!debugEnabled || !debugSerial) return;
     
@@ -149,7 +181,7 @@ void DeviceHub::setupCoAPResources() {
         log("Callback fired for path: v2/actions");
         if (packet.code == COAP_POST) {
             log("Handling POST /v2/actions request...");
-            StaticJsonDocument<512> doc;
+            JsonDocument doc;
             DeserializationError error = deserializeJson(doc, packet.payload, packet.payloadlen);
             
             log("Payload: %s", doc.as<String>().c_str());
@@ -183,7 +215,7 @@ void DeviceHub::setupCoAPResources() {
 }
 
 String DeviceHub::processRequest(const JsonObject& doc) {
-    if (doc.containsKey("action")) {
+    if (!doc["action"].isNull()) {
         String actionId = doc["action"].as<String>();
         JsonObject payload = doc["payload"].as<JsonObject>();
         return handleAction(actionId, payload);
@@ -196,7 +228,7 @@ String DeviceHub::handleAction(const String& actionId, const JsonObject& payload
     if (actions.find(actionId) != actions.end()) {
         String response = actions[actionId].callback(payload);
         // Send action response event
-        StaticJsonDocument<1024> doc;
+        JsonDocument doc;
         doc["type"] = "action_response";
         doc["uuid"] = deviceUUID;
         doc["action"] = actionId;
@@ -214,7 +246,7 @@ void DeviceHub::notifyObservers(const String& eventId, const JsonObject& payload
     for (const auto& observer : observers) {
         if (observer.version == version) {
             // Send notification to observer
-            StaticJsonDocument<1024> doc;
+            JsonDocument doc;
             doc["event"] = eventId;
             doc["payload"] = payload;
                 doc["timestamp"] = millis();
@@ -251,8 +283,8 @@ void DeviceHub::sendCoAPResponse(IPAddress ip, int port, uint16_t messageId,
 }
 
 String DeviceHub::getSupportedVersions() {
-    StaticJsonDocument<256> doc;
-    JsonArray versions = doc.createNestedArray("versions");
+    JsonDocument doc;
+    JsonArray versions = doc["versions"].to<JsonArray>();
     versions.add(DEVICEHUB_VERSION_2);
     
     String output;
@@ -276,7 +308,7 @@ void DeviceHub::handleIncomingPacket() {
         }
         Serial.printf("UDP packet received from %s:%d - %s\n", discoveryUdp.remoteIP().toString().c_str(), discoveryUdp.remotePort(), incomingPacket);
 
-        StaticJsonDocument<512> doc;
+        JsonDocument doc;
         DeserializationError error = deserializeJson(doc, incomingPacket);
         if (error) {
             Serial.print(F("deserializeJson() failed: "));
@@ -284,7 +316,7 @@ void DeviceHub::handleIncomingPacket() {
             return;
         }
 
-        if (doc.containsKey("type")) {
+        if (!doc["type"].isNull()) {
             String messageType = doc["type"].as<String>();
 
             if (messageType == "REQUEST_DEVICE_INFO") {
@@ -302,7 +334,7 @@ String DeviceHub::getDeviceInfo() {
     
     // Use a larger document size temporarily to measure the full potential size
     // We won't serialize from this if it's too big for the CoAP buffer.
-    StaticJsonDocument<2048> doc;
+    JsonDocument doc;
     
     doc["type"] = "device_info";
     doc["version"] = API_VERSION;
@@ -310,18 +342,18 @@ String DeviceHub::getDeviceInfo() {
     doc["name"] = deviceName;
     doc["deviceType"] = deviceType;
 
-    JsonObject capabilities = doc.createNestedObject("capabilities");
-    JsonArray actionsArray = capabilities.createNestedArray("actions");
+    JsonObject capabilities = doc["capabilities"].to<JsonObject>();
+    JsonArray actionsArray = capabilities["actions"].to<JsonArray>();
     for (const auto& actionPair : actions) {
         const Action& action = actionPair.second;
-        JsonObject actionObj = actionsArray.createNestedObject();
+        JsonObject actionObj = actionsArray.add<JsonObject>();
         actionObj["id"] = action.id;
         actionObj["name"] = action.name;
         
         // Re-enable parameters
-        JsonArray parametersArray = actionObj.createNestedArray("parameters");
+        JsonArray parametersArray = actionObj["parameters"].to<JsonArray>();
         for (const auto& param : action.parameters) {
-            JsonObject paramObj = parametersArray.createNestedObject();
+            JsonObject paramObj = parametersArray.add<JsonObject>();
             paramObj["name"] = param.name;
             paramObj["type"] = param.type;
             paramObj["unit"] = param.unit;
@@ -331,17 +363,17 @@ String DeviceHub::getDeviceInfo() {
         }
     }
 
-    JsonArray eventsArray = capabilities.createNestedArray("events");
+    JsonArray eventsArray = capabilities["events"].to<JsonArray>();
     for (const auto& eventPair : events) {
         const Event& event = eventPair.second;
-        JsonObject eventObj = eventsArray.createNestedObject();
+        JsonObject eventObj = eventsArray.add<JsonObject>();
         eventObj["id"] = event.id;
         eventObj["name"] = event.name;
         // Re-enable schema
         eventObj["dataSchema"] = event.dataSchema;
     }
 
-    JsonObject status = doc.createNestedObject("status");
+    JsonObject status = doc["status"].to<JsonObject>();
     switch (currentState) {
         case DeviceState::Normal: status["state"] = "normal"; break;
         case DeviceState::Emergency: status["state"] = "emergency"; break;
@@ -367,7 +399,7 @@ String DeviceHub::getDeviceInfo() {
     } else {
         // Payload too large, generate a minimal truncated message
         log("Error: Full device info exceeds CoAP buffer limit (%d bytes). Sending truncated info.", COAP_BUFFER_LIMIT);
-        StaticJsonDocument<256> truncatedDoc; // Small buffer for fallback
+        JsonDocument truncatedDoc; // Small buffer for fallback
         truncatedDoc["type"] = "device_info_truncated";
         truncatedDoc["version"] = API_VERSION;
         truncatedDoc["uuid"] = deviceUUID;
@@ -416,7 +448,7 @@ String DeviceHub::getDeviceUUID() {
 }
 
 void DeviceHub::sendMessage(const String& message, const String& type) {
-    StaticJsonDocument<256> doc;
+    JsonDocument doc;
     doc["type"] = type;
     doc["version"] = API_VERSION;
     doc["deviceName"] = deviceName;
@@ -646,7 +678,7 @@ void DeviceHub::handleEmergencyPacket() {
         }
         Serial.printf("Emergency UDP packet received from %s:%d - %s\n", emergencyUdp.remoteIP().toString().c_str(), emergencyUdp.remotePort(), incomingPacket);
 
-        StaticJsonDocument<512> doc;
+        JsonDocument doc;
         DeserializationError error = deserializeJson(doc, incomingPacket);
         if (error) {
             Serial.print(F("deserializeJson() failed: "));
@@ -705,7 +737,7 @@ void DeviceHub::emitEvent(const String& eventId, const JsonObject& payload) {
     // const Event& registeredEvent = events[eventId];
     log("Event '%s' is registered. Proceeding with emission.", eventId.c_str());
     
-    StaticJsonDocument<1024> doc;
+    JsonDocument doc;
     doc["type"] = "device_event";
     doc["uuid"] = deviceUUID;
     doc["event"] = eventId;
