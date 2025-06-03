@@ -16,12 +16,38 @@
 // Protocol versions
 #define DEVICEHUB_VERSION_2 "2.0.0"
 
+// Dual-core configuration
+#define DEVICEHUB_NETWORK_TASK_STACK_SIZE 8192
+#define DEVICEHUB_NETWORK_TASK_PRIORITY 1
+#define DEVICEHUB_NETWORK_CORE 0
+#define DEVICEHUB_APPLICATION_CORE 1
+#define DEVICEHUB_QUEUE_SIZE 10
+
 // CoAP ports
 #define COAP_PORT 5683
 #define SECURE_COAP_PORT 5684
 #define DISCOVERY_PORT 8888
 static const uint16_t EMERGENCY_PORT = 8890;
 static const uint16_t EMERGENCY_NOTIFICATION_PORT = 8891;
+
+// AP Mode defaults
+#define DEFAULT_AP_PASSWORD "devicehub123"
+#define DEFAULT_WIFI_TIMEOUT_MS 20000
+#define DEFAULT_CONNECTION_CHECK_INTERVAL_MS 30000
+#define DEFAULT_SIGNAL_STRENGTH_CHECK_INTERVAL_MS 60000
+#define DEFAULT_MIN_SIGNAL_STRENGTH -80  // dBm - below this will trigger reconnection attempt
+#define DEFAULT_AP_OPEN_NETWORK false    // Default to password-protected AP
+#define AP_IP_ADDRESS "192.168.4.1"
+#define AP_GATEWAY "192.168.4.1"
+#define AP_SUBNET "255.255.255.0"
+
+// Include FreeRTOS headers for dual-core support
+#if defined(ESP32)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#endif
 
 enum class DeviceState {
     Normal,
@@ -31,6 +57,12 @@ enum class DeviceState {
     Error
 };
 
+enum class WiFiMode {
+    Station,      // Connected to WiFi network
+    AccessPoint,  // Running as Access Point
+    Offline       // No connection
+};
+
 struct ActionParameter {
     String name;
     String type;
@@ -38,6 +70,31 @@ struct ActionParameter {
     float defaultValue;
     float min;
     float max;
+};
+
+// Inter-core communication structures
+struct NetworkCommand {
+    enum Type {
+        WIFI_RECONNECT,
+        AP_MODE_SWITCH,
+        SEND_DEVICE_INFO,
+        EMIT_EVENT,
+        FORCE_AP_MODE,
+        CHECK_CONNECTION
+    };
+    Type type;
+    String data;
+    JsonDocument payload;
+};
+
+struct NetworkStatus {
+    WiFiMode wifiMode;
+    bool connected;
+    int signalStrength;
+    IPAddress currentIP;
+    String lastError;
+    unsigned long lastUpdate;
+    bool isAPMode;
 };
 
 class DeviceHub {
@@ -80,7 +137,22 @@ public:
         int retries = 0;
     };
 
+    // Enhanced constructor with dual-core support
     DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType = "esp32");
+    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
+              const char* apPassword, int wifiTimeoutMs = DEFAULT_WIFI_TIMEOUT_MS, bool enableAPFallback = true);
+    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
+              const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
+              int connectionCheckIntervalMs, int minSignalStrength = DEFAULT_MIN_SIGNAL_STRENGTH);
+    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
+              const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
+              int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore);
+    
+    // New constructor with passwordless AP option
+    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
+              const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
+              int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore, bool openAP);
+              
     ~DeviceHub();
     void begin();
     void begin(HardwareSerial& serial);
@@ -124,8 +196,11 @@ public:
     void disableDebug();
     void log(const char* format, ...);
 
+    WiFiClass getWiFi();
+
     // allow device to be discovered via mDNS using the <device name>.local domain
-    void startMDNS();               
+    void startMDNS();           
+    static String toMdnsHost(String);     
     // Static members
     static const IPAddress BROADCAST_IP;
 
@@ -137,6 +212,30 @@ public:
                           COAP_CONTENT_TYPE type,
                           const uint8_t *token, 
                           int tokenlen);
+
+    // New AP fallback methods
+    bool isAPMode() const;                    // Returns true if in AP mode
+    bool isConnected() const;                 // Returns true if WiFi connected
+    String getAPSSID() const;                 // Get generated AP network name
+    String getMDNSHostname() const;           // Get mDNS hostname (.local)
+    IPAddress getIP() const;                  // Get device IP (WiFi or AP)
+    void checkConnection();                   // Check/attempt reconnection
+    void forceAPMode();                       // Force switch to AP mode
+    WiFiMode getWiFiMode() const;            // Get current WiFi mode
+    bool isAPOpen() const;                    // Returns true if AP is passwordless
+
+    // Enhanced connection monitoring methods
+    int getSignalStrength() const;            // Get current WiFi signal strength (dBm)
+    unsigned long getLastConnectionCheck() const;  // Get timestamp of last connection check
+    bool isSignalWeak() const;                // Check if signal is below minimum threshold
+    void setConnectionCheckInterval(int intervalMs);  // Configure check interval
+    void setMinSignalStrength(int minStrength);       // Configure minimum signal strength
+
+    // Dual-core status methods
+    bool isDualCoreMode() const;              // Returns true if running in dual-core mode
+    bool isSingleCoreMode() const;            // Returns true if running in single-core mode
+    int getCoreCount() const;                 // Returns detected core count
+    bool isNetworkTaskRunning() const;        // Returns true if network task is active
 
 private:
     const char* ssid;
@@ -167,6 +266,42 @@ private:
     ActionCallback emergencyAction = nullptr;
     ActionCallback resetAction = nullptr;
 
+    // AP fallback configuration
+    const char* apPassword;
+    int wifiTimeoutMs;
+    bool enableAPFallback;
+    WiFiMode currentWiFiMode;
+    String apSSID;
+    String mdnsHostname;
+    unsigned long lastConnectionCheck;
+    unsigned long lastSignalCheck;
+    int connectionCheckIntervalMs;
+    int minSignalStrength;
+    int currentSignalStrength;
+    bool apModeForced;
+    unsigned long totalReconnectionAttempts;
+    unsigned long successfulReconnections;
+    bool openAPMode;  // New: true for passwordless AP
+
+    // Dual-core support members
+    bool forceSingleCore;
+    bool isDualCore;
+    int detectedCores;
+    TaskHandle_t networkTaskHandle;
+    QueueHandle_t commandQueue;
+    QueueHandle_t statusQueue;
+    SemaphoreHandle_t statusMutex;
+    NetworkStatus currentNetworkStatus;
+    bool networkTaskRunning;
+    unsigned long lastNetworkTaskHealthCheck;
+    
+    // Thread-safe status cache (updated from network task)
+    volatile WiFiMode cachedWiFiMode;
+    volatile bool cachedConnected;
+    volatile int cachedSignalStrength;
+    volatile bool cachedIsAPMode;
+    IPAddress cachedIP;
+
     void ensureDeviceUUID();
     void generateAndStoreUUID();
     bool isUUIDValid();
@@ -182,8 +317,6 @@ private:
     void sendAck(const String& messageId);
     void sendUdpMessage(const String& payload);
 
-    void connectWiFi();
-
     void handleIncomingPacket();
     void sendDeviceInfo();
 
@@ -192,7 +325,40 @@ private:
     void handleEmergencyEnd();
   
     bool mdnsRunning = false;
-    static String toMdnsHost(String); 
+
+    // New private methods for AP functionality
+    bool attemptWiFiConnection();
+    void setupAccessPoint();
+    void setupStationMode();
+    void setupMDNS();
+    void checkAndReconnect();
+    String generateAPSSID() const;
+    String generateMDNSHostname() const;
+    
+    // Enhanced WiFi monitoring methods
+    void monitorSignalStrength();
+    String getSignalQualityDescription(int rssi) const;
+
+    // Dual-core specific methods
+    bool detectAndSetupDualCore();
+    void startNetworkTask();
+    void stopNetworkTask();
+    static void networkTaskFunction(void* parameter);
+    void handleNetworkOperations();
+    bool sendNetworkCommand(NetworkCommand::Type type, const String& data = "", const JsonDocument& payload = JsonDocument());
+    void updateStatusFromNetworkTask(const NetworkStatus& status);
+    void checkNetworkTaskHealth();
+    bool initializeFreeRTOSObjects();
+    void cleanupFreeRTOSObjects();
+    
+    // Thread-safe wrapper methods
+    void safeUpdateWiFiMode(WiFiMode mode);
+    void safeUpdateConnectionStatus(bool connected);
+    void safeUpdateSignalStrength(int strength);
+    void safeUpdateIP(IPAddress ip);
+    
+    // NVS initialization (handles ESP32 Non-Volatile Storage setup)
+    void initializeNVS();
 
 };
 
