@@ -152,6 +152,9 @@ public:
     DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
               const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
               int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore, bool openAP);
+    
+    // Constructor that forces AP-only mode (no WiFi connection attempts)
+    DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP = false);
               
     ~DeviceHub();
     void begin();
@@ -223,6 +226,7 @@ public:
     void forceAPMode();                       // Force switch to AP mode
     WiFiMode getWiFiMode() const;            // Get current WiFi mode
     bool isAPOpen() const;                    // Returns true if AP is passwordless
+    bool isAPOnlyMode() const;                // Returns true if device is in AP-only mode (no WiFi)
 
     // Enhanced connection monitoring methods
     int getSignalStrength() const;            // Get current WiFi signal strength (dBm)

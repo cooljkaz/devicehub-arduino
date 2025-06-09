@@ -164,6 +164,42 @@ DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceN
     if (this->openAPMode) { log("Open (passwordless) AP mode enabled for easier device setup"); }
 }
 
+// AP-only constructor - forces AP mode without any WiFi connection attempts
+DeviceHub::DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP)
+    : ssid(""), password(""), deviceName(deviceName), deviceType(deviceType), 
+      currentState(DeviceState::Normal), dtlsEnabled(false),
+      coap(nullptr), secureCoap(nullptr),
+      debugSerial(nullptr), debugEnabled(false),
+      apPassword(apPassword), wifiTimeoutMs(0), enableAPFallback(false),
+      currentWiFiMode(WiFiMode::Offline), lastConnectionCheck(0), lastSignalCheck(0),
+      connectionCheckIntervalMs(DEFAULT_CONNECTION_CHECK_INTERVAL_MS), 
+      minSignalStrength(DEFAULT_MIN_SIGNAL_STRENGTH), currentSignalStrength(-100),
+      apModeForced(true), totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(openAP),
+      forceSingleCore(false), isDualCore(false), detectedCores(1),
+      networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
+      networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
+      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
+    initializeNVS();
+    if (!this->openAPMode && strlen(this->apPassword) < 8) { 
+        this->apPassword = DEFAULT_AP_PASSWORD; 
+        this->openAPMode = false; 
+        log("Warning: AP password too short for secure mode, using default: %s", DEFAULT_AP_PASSWORD); 
+    }
+    prefs.begin("devicehub", false);
+    apSSID = generateAPSSID();
+    mdnsHostname = generateMDNSHostname();
+    currentNetworkStatus.wifiMode = WiFiMode::Offline;
+    currentNetworkStatus.connected = false;
+    currentNetworkStatus.signalStrength = -100;
+    currentNetworkStatus.lastUpdate = 0;
+    currentNetworkStatus.isAPMode = false;
+    if (this->openAPMode) { 
+        log("AP-only mode: Open (passwordless) Access Point enabled"); 
+    } else {
+        log("AP-only mode: Secured Access Point enabled"); 
+    }
+}
+
 DeviceHub::~DeviceHub() {
     log("Cleaning up DeviceHub...");
     
@@ -270,7 +306,14 @@ void DeviceHub::begin(HardwareSerial& serial) {
     
     setupCoAPResources();
     ensureDeviceUUID();
-    otaHelper.start(ssid, password, deviceName, password, 3232, 115200);
+    
+    // Only start OTA helper if we have WiFi credentials (not AP-only mode)
+    if (!isAPOnlyMode() && strlen(ssid) > 0) {
+        log("Starting OTA helper...");
+        otaHelper.start(ssid, password, deviceName, password, 3232, 115200);
+    } else {
+        log("Skipping OTA helper (AP-only mode or no WiFi credentials)");
+    }
     
     log("DeviceHub initialized successfully");
     
@@ -1172,57 +1215,81 @@ bool DeviceHub::attemptWiFiConnection() {
 void DeviceHub::setupAccessPoint() {
     log("Setting up WiFi Access Point...");
     
-    // Stop any existing WiFi connections
-    WiFi.disconnect();
+    // Ensure clean WiFi state
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(500);  // Give time for WiFi to fully stop
+    
+    log("Setting WiFi mode to AP...");
     WiFi.mode(WIFI_AP);
+    delay(100);
     
     // Configure AP with custom IP
     IPAddress local_ip(192, 168, 4, 1);
     IPAddress gateway(192, 168, 4, 1);
     IPAddress subnet(255, 255, 255, 0);
     
+    log("Configuring AP IP settings...");
     if (!WiFi.softAPConfig(local_ip, gateway, subnet)) {
-        log("AP config failed");
+        log("ERROR: AP IP config failed!");
+        currentWiFiMode = WiFiMode::Offline;
         return;
     }
     
     // Start the access point (with or without password)
+    log("Starting AP with SSID: '%s'", apSSID.c_str());
     bool apStarted;
     if (openAPMode) {
         // Open network (no password)
+        log("Creating OPEN (passwordless) Access Point...");
         apStarted = WiFi.softAP(apSSID.c_str());
-        log("Creating OPEN (passwordless) Access Point for easy setup...");
     } else {
         // Secured network (with password)
+        log("Creating SECURED Access Point with password...");
         apStarted = WiFi.softAP(apSSID.c_str(), apPassword);
     }
     
     if (apStarted) {
-        currentWiFiMode = WiFiMode::AccessPoint;
-        log("Access Point started successfully!");
-        log("SSID: %s", apSSID.c_str());
+        // Give AP time to fully initialize
+        delay(1000);
         
-        if (openAPMode) {
-            log("Security: OPEN (no password required)");
-            log("⚠️  Warning: Open network - anyone can connect!");
+        // Verify AP is actually running
+        if (WiFi.getMode() & WIFI_AP) {
+            currentWiFiMode = WiFiMode::AccessPoint;
+            log("✅ Access Point started successfully!");
+            log("SSID: %s", apSSID.c_str());
+            log("WiFi Mode: %d (should include AP bit)", WiFi.getMode());
+            
+            if (openAPMode) {
+                log("Security: OPEN (no password required)");
+                log("⚠️  Warning: Open network - anyone can connect!");
+            } else {
+                log("Security: WPA2 with password");
+                log("Password: %s", apPassword);
+            }
+            
+            log("IP address: %s", WiFi.softAPIP().toString().c_str());
+            log("MAC address: %s", WiFi.softAPmacAddress().c_str());
+            
+            // Check channel
+            int channel = WiFi.channel();
+            log("Operating on channel: %d", channel);
+            
+            if (openAPMode) {
+                log("📱 Connect to '%s' network (no password needed)", apSSID.c_str());
+                log("🌐 Then access: http://%s.local or http://%s", 
+                    mdnsHostname.c_str(), WiFi.softAPIP().toString().c_str());
+            }
+            
+            // Skip AP visibility check - scanning interferes with AP operation on ESP32
+            
         } else {
-            log("Security: WPA2 with password");
-            log("Password: %s", apPassword);
-        }
-        
-        log("IP address: %s", WiFi.softAPIP().toString().c_str());
-        
-        // Find and log the best channel
-        int channel = WiFi.channel();
-        log("Operating on channel: %d", channel);
-        
-        if (openAPMode) {
-            log("📱 Connect to '%s' network (no password needed)", apSSID.c_str());
-            log("🌐 Then access: http://%s.local or http://%s", 
-                mdnsHostname.c_str(), WiFi.softAPIP().toString().c_str());
+            log("ERROR: AP started but WiFi mode incorrect!");
+            currentWiFiMode = WiFiMode::Offline;
         }
     } else {
-        log("Failed to start Access Point!");
+        log("ERROR: Failed to start Access Point!");
+        log("WiFi Mode after failure: %d", WiFi.getMode());
         currentWiFiMode = WiFiMode::Offline;
     }
 }
@@ -1325,7 +1392,18 @@ void DeviceHub::checkAndReconnect() {
 }
 
 String DeviceHub::generateAPSSID() const {
-    return toMdnsHost(String(deviceName));
+    String ssid = toMdnsHost(String(deviceName));
+    // Ensure SSID is valid (max 32 chars, no special chars)
+    if (ssid.length() > 32) {
+        ssid = ssid.substring(0, 32);
+    }
+    // Replace any remaining problematic characters
+    ssid.replace("-", "");
+    ssid.replace("_", "");
+    if (ssid.length() == 0) {
+        ssid = "DeviceHub";
+    }
+    return ssid;
 }
 
 String DeviceHub::generateMDNSHostname() const {
@@ -1816,6 +1894,10 @@ void DeviceHub::safeUpdateIP(IPAddress ip) {
 
 bool DeviceHub::isAPOpen() const {
     return openAPMode;
+}
+
+bool DeviceHub::isAPOnlyMode() const {
+    return apModeForced && (strlen(ssid) == 0 || strcmp(ssid, "") == 0);
 }
 
 void DeviceHub::initializeNVS() {
