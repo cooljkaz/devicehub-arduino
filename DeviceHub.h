@@ -28,7 +28,6 @@
 #define SECURE_COAP_PORT 5684
 #define DISCOVERY_PORT 8888
 static const uint16_t EMERGENCY_PORT = 8890;
-static const uint16_t EMERGENCY_NOTIFICATION_PORT = 8891;
 
 // AP Mode defaults
 #define DEFAULT_AP_PASSWORD "devicehub123"
@@ -49,7 +48,7 @@ static const uint16_t EMERGENCY_NOTIFICATION_PORT = 8891;
 #include "freertos/semphr.h"
 #endif
 
-enum class DeviceState {
+enum class DeviceState { 
     Normal,
     Emergency,
     Idle,
@@ -189,7 +188,7 @@ public:
     String getDeviceInfo(const String& version);  // Version-specific device info
     String getDeviceInfo();                         // Convenience overload without parameters
     
-    // Message sending (legacy UDP)
+    // Message sending (v2 CoAP only, legacy methods retained for API compatibility)
     void sendMessage(const String& message, const String& type = "message");
     void sendEmergency(const String& message);
     void sendEmergencyResponse(const char* message);
@@ -206,6 +205,7 @@ public:
     static String toMdnsHost(String);     
     // Static members
     static const IPAddress BROADCAST_IP;
+    static const IPAddress COAP_MULTICAST_IP; // 224.0.1.187
 
     // CoAP Helper
     String processRequest(const JsonObject& doc);

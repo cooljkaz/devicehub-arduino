@@ -13,6 +13,7 @@
 
 Preferences prefs;
 const IPAddress DeviceHub::BROADCAST_IP(255, 255, 255, 255);
+const IPAddress DeviceHub::COAP_MULTICAST_IP(224, 0, 1, 187);
 const char* DeviceHub::API_VERSION = DEVICEHUB_VERSION_2;
 
 // UDP instances only
@@ -901,28 +902,33 @@ void DeviceHub::ensureDeviceUUID() {
 
 void DeviceHub::generateAndStoreUUID() {
     // Generate version 4 UUID (random)
-    uint32_t uuidParts[4];
+    uint8_t uuidBytes[16];
     
     // Get random bytes
-    for (int i = 0; i < 4; i++) {
-        uuidParts[i] = esp_random();
+    for (int i = 0; i < 16; i += 4) {
+        uint32_t randomValue = esp_random();
+        uuidBytes[i] = (randomValue >> 24) & 0xFF;
+        uuidBytes[i + 1] = (randomValue >> 16) & 0xFF;
+        uuidBytes[i + 2] = (randomValue >> 8) & 0xFF;
+        uuidBytes[i + 3] = randomValue & 0xFF;
     }
+    
+    // Set version bits (4 in upper nibble of byte 6)
+    uuidBytes[6] = (uuidBytes[6] & 0x0F) | 0x40;
+    
+    // Set variant bits (10 in upper 2 bits of byte 8)
+    uuidBytes[8] = (uuidBytes[8] & 0x3F) | 0x80;
     
     // Format as UUID string (8-4-4-4-12)
     char uuidStr[37];
     snprintf(uuidStr, sizeof(uuidStr),
-        "%08x-%04x-%04x-%04x-%04x%08x",
-        (unsigned int)(uuidParts[0]),
-        (unsigned int)(uuidParts[1] >> 16) & 0xFFFF,
-        (unsigned int)(uuidParts[1] & 0xFFFF),
-        (unsigned int)(uuidParts[2] >> 16) & 0xFFFF,
-        (unsigned int)(uuidParts[2] & 0xFFFF),
-        (unsigned int)(uuidParts[3])
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        uuidBytes[0], uuidBytes[1], uuidBytes[2], uuidBytes[3],
+        uuidBytes[4], uuidBytes[5],
+        uuidBytes[6], uuidBytes[7],
+        uuidBytes[8], uuidBytes[9],
+        uuidBytes[10], uuidBytes[11], uuidBytes[12], uuidBytes[13], uuidBytes[14], uuidBytes[15]
     );
-    
-    // Set version bits (4) and variant bits (8,9)
-    uuidStr[14] = '4';
-    uuidStr[19] = (uuidStr[19] & 0x3F) | 0x80;
     
     deviceUUID = String(uuidStr);
     
@@ -1913,5 +1919,20 @@ void DeviceHub::initializeNVS() {
     } else {
         log("NVS initialized successfully");
     }
+}
+
+// v2-only emergency: send as a CoAP device_event with event='emergency'
+void DeviceHub::sendEmergency(const String& message) {
+    JsonDocument doc;
+    doc["type"] = "device_event";
+    doc["version"] = DEVICEHUB_VERSION_2;
+    doc["uuid"] = deviceUUID;
+    doc["event"] = "emergency";
+    doc["data"]["message"] = message;
+
+    String payload;
+    serializeJson(doc, payload);
+    // NON-confirmable is fine for alarms; hub listens on 5683 and joins 224.0.1.187
+    sendCoAPMessage(payload, COAP_NONCON);
 }
 
