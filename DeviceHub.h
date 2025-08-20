@@ -153,7 +153,7 @@ public:
               int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore, bool openAP);
     
     // Constructor that forces AP-only mode (no WiFi connection attempts)
-    DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP = false);
+    DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP);
               
     ~DeviceHub();
     void begin();
