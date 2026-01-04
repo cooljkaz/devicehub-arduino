@@ -225,7 +225,7 @@ void DeviceHub::begin() {
     begin(Serial);
 }
 
-void DeviceHub::begin(HardwareSerial& serial) {
+void DeviceHub::begin(Print& serial) {
     debugSerial = &serial;
     debugEnabled = true;
     log("DeviceHub::begin() called - Initializing core systems...");
@@ -244,12 +244,8 @@ void DeviceHub::begin(HardwareSerial& serial) {
     }
 #endif
 
-    // UDP Sockets are bound here now, after netif/event loop is up.
-    if (discoveryUdp.begin(DISCOVERY_PORT)) {
-        log("Discovery UDP: Bound to port %d", DISCOVERY_PORT);
-    } else {
-        log("Discovery UDP: Failed to bind");
-    }
+    // UDP Socket for emergency broadcasts (port 8890)
+    // Note: Discovery now uses standard CoAP multicast on port 5683
     if (emergencyUdp.begin(EMERGENCY_PORT)) {
         log("Emergency UDP: Bound to port %d", EMERGENCY_PORT);
     } else {
@@ -352,7 +348,7 @@ void DeviceHub::begin(HardwareSerial& serial) {
     }
 }
 
-void DeviceHub::enableDebug(HardwareSerial& serial) {
+void DeviceHub::enableDebug(Print& serial) {
     debugSerial = &serial;
     debugEnabled = true;
     log("Debug logging enabled");
@@ -392,7 +388,8 @@ void DeviceHub::log(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     
-    debugSerial->printf("[DeviceHub] %s\n", buffer);
+    debugSerial->print("[DeviceHub] ");
+    debugSerial->println(buffer);
 }
 
 void DeviceHub::loop() {
@@ -480,57 +477,121 @@ void DeviceHub::loop() {
 }
 
 void DeviceHub::setupCoAPResources() {
-    log("Setting up CoAP server resources (Simplified Approach)...");
+    log("Setting up CoAP server resources (RFC 6690 Standard Discovery)...");
 
-    // --- Handler for POST /v2/actions/resetPuzzle --- 
+    // RFC 6690: Standard discovery endpoint /.well-known/core
+    // Returns CoRE Link Format listing available resources
+    coap->server([this](CoapPacket& packet, IPAddress ip, int port) {
+        if (packet.code == COAP_GET) {
+            log("Handling GET /.well-known/core from %s:%d", ip.toString().c_str(), port);
+            String links = getWellKnownCore();
+            log("Responding with CoRE Link Format: %s", links.c_str());
+            sendCoAPResponse(ip, port, packet.messageid, links,
+                           COAP_CONTENT, (COAP_CONTENT_TYPE)COAP_CONTENT_TYPE_LINK_FORMAT,
+                           packet.token, packet.tokenlen);
+        } else {
+            sendCoAPResponse(ip, port, packet.messageid, "",
+                           COAP_METHOD_NOT_ALLOWD, COAP_NONE,
+                           packet.token, packet.tokenlen);
+        }
+    }, ".well-known/core");
+
+    // Device info endpoint (GET /info) - returns full JSON device capabilities
+    coap->server([this](CoapPacket& packet, IPAddress ip, int port) {
+        if (packet.code == COAP_GET) {
+            log("Handling GET /info from %s:%d", ip.toString().c_str(), port);
+            String deviceInfo = getDeviceInfo();
+            sendCoAPResponse(ip, port, packet.messageid, deviceInfo,
+                           COAP_CONTENT, COAP_APPLICATION_JSON,
+                           packet.token, packet.tokenlen);
+        } else {
+            sendCoAPResponse(ip, port, packet.messageid, "",
+                           COAP_METHOD_NOT_ALLOWD, COAP_NONE,
+                           packet.token, packet.tokenlen);
+        }
+    }, "info");
+
+    // Action endpoint (POST /action) - standard short path
+    coap->server([this](CoapPacket& packet, IPAddress ip, int port) {
+        if (packet.code == COAP_POST) {
+            log("Handling POST /action from %s:%d", ip.toString().c_str(), port);
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, packet.payload, packet.payloadlen);
+
+            if (error) {
+                log("JSON deserialization failed: %s", error.c_str());
+                sendCoAPResponse(ip, port, packet.messageid, "{\"error\":\"Invalid JSON\"}",
+                                 COAP_BAD_REQUEST, COAP_APPLICATION_JSON,
+                                 packet.token, packet.tokenlen);
+            } else {
+                String result = processRequest(doc.as<JsonObject>());
+                sendCoAPResponse(ip, port, packet.messageid, result,
+                            COAP_CHANGED, COAP_APPLICATION_JSON,
+                            packet.token, packet.tokenlen);
+            }
+        } else {
+            sendCoAPResponse(ip, port, packet.messageid, "",
+                             COAP_METHOD_NOT_ALLOWD, COAP_NONE,
+                             packet.token, packet.tokenlen);
+        }
+    }, "action");
+
+    // Legacy v2/actions endpoint (POST) - for backward compatibility during transition
     coap->server([this](CoapPacket& packet, IPAddress ip, int port) {
         log("Callback fired for path: v2/actions");
         if (packet.code == COAP_POST) {
             log("Handling POST /v2/actions request...");
             JsonDocument doc;
             DeserializationError error = deserializeJson(doc, packet.payload, packet.payloadlen);
-            
+
             log("Payload: %s", doc.as<String>().c_str());
 
             if (error) {
                 log("JSON deserialization failed: %s", error.c_str());
-                sendCoAPResponse(ip, port, packet.messageid, "Error: Invalid JSON payload.", 
-                                 COAP_BAD_REQUEST, COAP_TEXT_PLAIN, 
+                sendCoAPResponse(ip, port, packet.messageid, "{\"error\":\"Invalid JSON\"}",
+                                 COAP_BAD_REQUEST, COAP_APPLICATION_JSON,
                                  packet.token, packet.tokenlen);
             } else {
                 String result = processRequest(doc.as<JsonObject>());
-                sendCoAPResponse(ip, port, packet.messageid, result, 
-                            COAP_CHANGED, COAP_TEXT_PLAIN, 
+                sendCoAPResponse(ip, port, packet.messageid, result,
+                            COAP_CHANGED, COAP_APPLICATION_JSON,
                             packet.token, packet.tokenlen);
             }
         } else {
-            log("Method %d not allowed for /v2/actions/resetPuzzle. Sending 4.05", packet.code);
-            sendCoAPResponse(ip, port, packet.messageid, "", 
-                             COAP_METHOD_NOT_ALLOWD, COAP_NONE, 
+            log("Method %d not allowed for /v2/actions. Sending 4.05", packet.code);
+            sendCoAPResponse(ip, port, packet.messageid, "",
+                             COAP_METHOD_NOT_ALLOWD, COAP_NONE,
                              packet.token, packet.tokenlen);
         }
         log("Finished handling v2/actions request.");
-    }, "v2/actions"); // Register specific path
+    }, "v2/actions");
 
     // Default response handler (for ACKs to our requests etc.)
     coap->response([this](CoapPacket& packet, IPAddress ip, int port) {
         log("Received CoAP ACK/Response (Message ID: %d, Type: %d)", packet.messageid, packet.type);
     });
-    
-    log("CoAP server resources set up (Simplified: Specific Paths).");
+
+    log("CoAP resources configured: /.well-known/core, /info, /action, /v2/actions");
 }
 
 String DeviceHub::processRequest(const JsonObject& doc) {
     if (!doc["action"].isNull()) {
         String actionId = doc["action"].as<String>();
         JsonObject payload = doc["payload"].as<JsonObject>();
-        return handleAction(actionId, payload);
+        // Extract correlation ID if present (could be "id" or "correlationId")
+        String correlationId = "";
+        if (!doc["id"].isNull()) {
+            correlationId = doc["id"].as<String>();
+        } else if (!doc["correlationId"].isNull()) {
+            correlationId = doc["correlationId"].as<String>();
+        }
+        return handleAction(actionId, payload, correlationId);
     }
     return "Invalid request";
 }
 
-String DeviceHub::handleAction(const String& actionId, const JsonObject& payload) {
-    log("Handling action: %s", actionId.c_str());
+String DeviceHub::handleAction(const String& actionId, const JsonObject& payload, const String& correlationId) {
+    log("Handling action: %s (correlationId: %s)", actionId.c_str(), correlationId.c_str());
     if (actions.find(actionId) != actions.end()) {
         String response = actions[actionId].callback(payload);
         // Send action response event
@@ -540,9 +601,12 @@ String DeviceHub::handleAction(const String& actionId, const JsonObject& payload
         doc["action"] = actionId;
         doc["status"] = "success";
         doc["version"] = DEVICEHUB_VERSION_2;
+        if (correlationId.length() > 0) {
+            doc["id"] = correlationId;
+        }
         String output;
         serializeJson(doc, output);
-        
+
         return output;
     }
     return "Action not found";
@@ -602,36 +666,8 @@ bool DeviceHub::isVersionSupported(const String& version) {
     return version == DEVICEHUB_VERSION_2;
 }
 
-void DeviceHub::handleIncomingPacket() {
-    int packetSize = discoveryUdp.parsePacket();
-    if (packetSize) {
-        char incomingPacket[255];
-        int len = discoveryUdp.read(incomingPacket, 255);
-        if (len > 0) {
-            incomingPacket[len] = 0;
-        }
-        Serial.printf("UDP packet received from %s:%d - %s\n", discoveryUdp.remoteIP().toString().c_str(), discoveryUdp.remotePort(), incomingPacket);
-
-        JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, incomingPacket);
-        if (error) {
-            Serial.print(F("deserializeJson() failed: "));
-            Serial.println(error.f_str());
-            return;
-        }
-
-        if (!doc["type"].isNull()) {
-            String messageType = doc["type"].as<String>();
-
-            if (messageType == "REQUEST_DEVICE_INFO") {
-                log("Received REQUEST_DEVICE_INFO");
-                sendDeviceInfo();
-            }
-        } else {
-            Serial.println("Received message without type field");
-        }
-    }
-}
+// NOTE: handleIncomingPacket() removed - discovery now uses standard CoAP multicast
+// Devices respond to GET /.well-known/core requests instead of UDP port 8888
 
 String DeviceHub::getDeviceInfo() {
     log("Generating full device info...");
@@ -717,28 +753,50 @@ String DeviceHub::getDeviceInfo() {
     return jsonString;
 }
 
+// Returns CoRE Link Format (RFC 6690) for /.well-known/core discovery
+String DeviceHub::getWellKnownCore() {
+    String links = "";
+
+    // Device info resource
+    links += "</info>;rt=\"device\";ct=50";
+
+    // Action resource
+    links += ",</action>;rt=\"action\";ct=50";
+
+    // Legacy v2/actions for compatibility
+    links += ",</v2/actions>;rt=\"action\";ct=50";
+
+    // Event resource (if events are registered)
+    if (!events.empty()) {
+        links += ",</event>;rt=\"event\";obs";
+    }
+
+    return links;
+}
+
 void DeviceHub::sendDeviceInfo() {
     log("Starting sendDeviceInfo process...");
     String deviceInfo = getDeviceInfo(); // Gets full or truncated info based on size check
-    
+
     if (!coap) {
         log("Error: CoAP instance is null in sendDeviceInfo.");
         return;
     }
 
-    log("Attempting to send device info via CoAP (NON-CONFIRMABLE - Payload size: %d)...", deviceInfo.length());
-    
-    // Send the CoAP message (full or truncated)
-    uint16_t messageId = coap->send(BROADCAST_IP, COAP_PORT, "device/info", 
+    log("Sending device info via CoAP multicast (NON-CONFIRMABLE - Payload size: %d)...", deviceInfo.length());
+
+    // Send device info to CoAP multicast group (224.0.1.187)
+    // This allows the hub daemon to receive periodic updates
+    uint16_t messageId = coap->send(COAP_MULTICAST_IP, COAP_PORT, "device/info",
                                     COAP_NONCON,
                                     COAP_POST, NULL, 0,
                                     (uint8_t*)deviceInfo.c_str(), deviceInfo.length(),
                                     COAP_APPLICATION_JSON);
-    
+
     if (messageId == 0) {
         log("Error: CoAP send function returned 0 (failed to send).");
     } else {
-        log("CoAP send function called successfully (NON-CONFIRMABLE). Message ID: %d", messageId);
+        log("CoAP multicast send successful. Message ID: %d", messageId);
     }
 
     log("Completed sendDeviceInfo process.");
@@ -1139,8 +1197,7 @@ bool DeviceHub::attemptWiFiConnection() {
     delay(100);
     
     // Configure WiFi with explicit settings to prevent connection errors
-    WiFi.config(0U, 0U, 0U, 0U); // Use DHCP
-    WiFi.setAutoConnect(false);
+    WiFi.config((uint32_t)0x00000000, (uint32_t)0x00000000, (uint32_t)0x00000000, (uint32_t)0x00000000); // Use DHCP
     WiFi.setAutoReconnect(false);
     
     // Begin connection with error checking

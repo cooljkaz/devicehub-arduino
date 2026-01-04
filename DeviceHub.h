@@ -26,8 +26,11 @@
 // CoAP ports
 #define COAP_PORT 5683
 #define SECURE_COAP_PORT 5684
-#define DISCOVERY_PORT 8888
 static const uint16_t EMERGENCY_PORT = 8890;
+
+// CoAP content types (RFC 7252)
+#define COAP_CONTENT_TYPE_LINK_FORMAT 40  // application/link-format (CoRE Link Format)
+#define COAP_CONTENT_TYPE_JSON 50         // application/json
 
 // AP Mode defaults
 #define DEFAULT_AP_PASSWORD "devicehub123"
@@ -153,11 +156,11 @@ public:
               int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore, bool openAP);
     
     // Constructor that forces AP-only mode (no WiFi connection attempts)
-    DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP = false);
+    DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP);
               
     ~DeviceHub();
     void begin();
-    void begin(HardwareSerial& serial);
+    void begin(Print& serial);
     void loop();
     
     // Action registration
@@ -194,7 +197,7 @@ public:
     void sendEmergencyResponse(const char* message);
 
     // Debug methods
-    void enableDebug(HardwareSerial& serial);
+    void enableDebug(Print& serial);
     void disableDebug();
     void log(const char* format, ...);
 
@@ -249,11 +252,10 @@ private:
     String deviceUUID;
     DeviceState currentState;
     bool dtlsEnabled;
-    HardwareSerial* debugSerial;
+    Print* debugSerial;
     bool debugEnabled;
 
     WiFiUDP udp;
-    WiFiUDP discoveryUdp;
     WiFiUDP emergencyUdp;
 
     Coap *coap;
@@ -311,7 +313,7 @@ private:
     bool isUUIDValid();
     void setupCoAPResources();
     void handleCoAPRequest(CoapPacket& packet, IPAddress ip, int port);
-    String handleAction(const String& actionId, const JsonObject& payload);
+    String handleAction(const String& actionId, const JsonObject& payload, const String& correlationId = "");
     void notifyObservers(const String& eventId, const JsonObject& payload, const String& version);
     void sendCoAPMessage(const String& payload);
     void sendCoAPMessage(const String& payload, COAP_TYPE messageType);
@@ -321,8 +323,8 @@ private:
     void sendAck(const String& messageId);
     void sendUdpMessage(const String& payload);
 
-    void handleIncomingPacket();
     void sendDeviceInfo();
+    String getWellKnownCore();  // Returns CoRE Link Format for /.well-known/core
 
     void handleEmergencyPacket();
     void handleEmergencyStart();
