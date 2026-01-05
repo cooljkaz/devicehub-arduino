@@ -600,6 +600,7 @@ String DeviceHub::handleAction(const String& actionId, const JsonObject& payload
         doc["uuid"] = deviceUUID;
         doc["action"] = actionId;
         doc["status"] = "success";
+        doc["data"] = response;  // Include the actual action response data
         doc["version"] = DEVICEHUB_VERSION_2;
         if (correlationId.length() > 0) {
             doc["id"] = correlationId;
