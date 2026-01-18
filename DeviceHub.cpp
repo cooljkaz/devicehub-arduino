@@ -10,6 +10,7 @@
 #include <esp_event.h>
 #include <esp_netif.h>
 #include <esp_wifi.h>
+#include <algorithm>
 
 Preferences prefs;
 const IPAddress DeviceHub::BROADCAST_IP(255, 255, 255, 255);
@@ -22,48 +23,24 @@ WiFiUDP udp;
 // Forward declaration for the helper function
 String getPathFromPacket(CoapPacket& packet);
 
-DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType)
-    : ssid(ssid), password(password), deviceName(deviceName), deviceType(deviceType), 
+// Single constructor - uses networks configured via build defines
+DeviceHub::DeviceHub(const char* deviceName)
+    : deviceName(deviceName), deviceType("esp32"),
       currentState(DeviceState::Normal), dtlsEnabled(false),
       coap(nullptr), secureCoap(nullptr),
       debugSerial(nullptr), debugEnabled(false),
-      apPassword(DEFAULT_AP_PASSWORD), wifiTimeoutMs(DEFAULT_WIFI_TIMEOUT_MS), enableAPFallback(true),
-      currentWiFiMode(WiFiMode::Offline), lastConnectionCheck(0), lastSignalCheck(0),
-      connectionCheckIntervalMs(DEFAULT_CONNECTION_CHECK_INTERVAL_MS), 
-      minSignalStrength(DEFAULT_MIN_SIGNAL_STRENGTH), currentSignalStrength(-100),
-      apModeForced(false), totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(DEFAULT_AP_OPEN_NETWORK),
-      forceSingleCore(false), isDualCore(false), detectedCores(1),
-      networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
-      networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
-      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
-    initializeNVS();
-    prefs.begin("devicehub", false);
-    apSSID = generateAPSSID();
-    mdnsHostname = generateMDNSHostname();
-    currentNetworkStatus.wifiMode = WiFiMode::Offline;
-    currentNetworkStatus.connected = false;
-    currentNetworkStatus.signalStrength = -100;
-    currentNetworkStatus.lastUpdate = 0;
-    currentNetworkStatus.isAPMode = false;
-}
-
-DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType,
-                     const char* apPassword, int wifiTimeoutMs, bool enableAPFallback)
-    : ssid(ssid), password(password), deviceName(deviceName), deviceType(deviceType), 
-      currentState(DeviceState::Normal), dtlsEnabled(false),
-      coap(nullptr), secureCoap(nullptr),
-      debugSerial(nullptr), debugEnabled(false),
-      apPassword(apPassword), wifiTimeoutMs(wifiTimeoutMs), enableAPFallback(enableAPFallback),
+      apPassword(DEFAULT_AP_PASSWORD), wifiTimeoutMs(DEFAULT_WIFI_TIMEOUT_MS), enableAPFallback(false),
       currentWiFiMode(WiFiMode::Offline), lastConnectionCheck(0), lastSignalCheck(0),
       connectionCheckIntervalMs(DEFAULT_CONNECTION_CHECK_INTERVAL_MS),
       minSignalStrength(DEFAULT_MIN_SIGNAL_STRENGTH), currentSignalStrength(-100),
       apModeForced(false), totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(DEFAULT_AP_OPEN_NETWORK),
+      currentEnvironment(WiFiEnvironment::Unknown), useMultiWiFi(true),
+      productionCheckIntervalMs(300000), lastProductionCheck(0),
       forceSingleCore(false), isDualCore(false), detectedCores(1),
       networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
       networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
       cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
     initializeNVS();
-    if (strlen(this->apPassword) < 8) { this->apPassword = DEFAULT_AP_PASSWORD; log("Warning: AP password too short, using default: %s", DEFAULT_AP_PASSWORD); }
     prefs.begin("devicehub", false);
     apSSID = generateAPSSID();
     mdnsHostname = generateMDNSHostname();
@@ -72,132 +49,57 @@ DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceN
     currentNetworkStatus.signalStrength = -100;
     currentNetworkStatus.lastUpdate = 0;
     currentNetworkStatus.isAPMode = false;
+
+    // Auto-configure networks from build defines
+    autoConfigureNetworks();
 }
 
-DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType,
-                     const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
-                     int connectionCheckIntervalMs, int minSignalStrength)
-    : ssid(ssid), password(password), deviceName(deviceName), deviceType(deviceType), 
-      currentState(DeviceState::Normal), dtlsEnabled(false),
-      coap(nullptr), secureCoap(nullptr),
-      debugSerial(nullptr), debugEnabled(false),
-      apPassword(apPassword), wifiTimeoutMs(wifiTimeoutMs), enableAPFallback(enableAPFallback),
-      currentWiFiMode(WiFiMode::Offline), lastConnectionCheck(0), lastSignalCheck(0),
-      connectionCheckIntervalMs(connectionCheckIntervalMs), minSignalStrength(minSignalStrength),
-      currentSignalStrength(-100), apModeForced(false), 
-      totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(DEFAULT_AP_OPEN_NETWORK),
-      forceSingleCore(false), isDualCore(false), detectedCores(1),
-      networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
-      networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
-      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
-    initializeNVS();
-    if (strlen(this->apPassword) < 8) { this->apPassword = DEFAULT_AP_PASSWORD; log("Warning: AP password too short, using default: %s", DEFAULT_AP_PASSWORD); }
-    if (this->connectionCheckIntervalMs < 5000) { this->connectionCheckIntervalMs = 5000; log("Warning: Connection check interval too short, using 5000ms"); }
-    if (this->minSignalStrength > -30 || this->minSignalStrength < -100) { this->minSignalStrength = DEFAULT_MIN_SIGNAL_STRENGTH; log("Warning: Invalid signal strength threshold, using default: %d dBm", DEFAULT_MIN_SIGNAL_STRENGTH); }
-    prefs.begin("devicehub", false);
-    apSSID = generateAPSSID();
-    mdnsHostname = generateMDNSHostname();
-    currentNetworkStatus.wifiMode = WiFiMode::Offline;
-    currentNetworkStatus.connected = false;
-    currentNetworkStatus.signalStrength = -100;
-    currentNetworkStatus.lastUpdate = 0;
-    currentNetworkStatus.isAPMode = false;
+// Configuration setters (call before begin())
+void DeviceHub::setDeviceType(const char* type) {
+    deviceType = type;
+    log("Device type set to: %s", type);
 }
 
-DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType,
-                     const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
-                     int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore)
-    : ssid(ssid), password(password), deviceName(deviceName), deviceType(deviceType), 
-      currentState(DeviceState::Normal), dtlsEnabled(false),
-      coap(nullptr), secureCoap(nullptr),
-      debugSerial(nullptr), debugEnabled(false),
-      apPassword(apPassword), wifiTimeoutMs(wifiTimeoutMs), enableAPFallback(enableAPFallback),
-      currentWiFiMode(WiFiMode::Offline), lastConnectionCheck(0), lastSignalCheck(0),
-      connectionCheckIntervalMs(connectionCheckIntervalMs), minSignalStrength(minSignalStrength),
-      currentSignalStrength(-100), apModeForced(false), 
-      totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(DEFAULT_AP_OPEN_NETWORK),
-      forceSingleCore(forceSingleCore), isDualCore(false), detectedCores(1),
-      networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
-      networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
-      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
-    initializeNVS();
-    if (strlen(this->apPassword) < 8) { this->apPassword = DEFAULT_AP_PASSWORD; log("Warning: AP password too short, using default: %s", DEFAULT_AP_PASSWORD); }
-    if (this->connectionCheckIntervalMs < 5000) { this->connectionCheckIntervalMs = 5000; log("Warning: Connection check interval too short, using 5000ms"); }
-    if (this->minSignalStrength > -30 || this->minSignalStrength < -100) { this->minSignalStrength = DEFAULT_MIN_SIGNAL_STRENGTH; log("Warning: Invalid signal strength threshold, using default: %d dBm", DEFAULT_MIN_SIGNAL_STRENGTH); }
-    prefs.begin("devicehub", false);
-    apSSID = generateAPSSID();
-    mdnsHostname = generateMDNSHostname();
-    currentNetworkStatus.wifiMode = WiFiMode::Offline;
-    currentNetworkStatus.connected = false;
-    currentNetworkStatus.signalStrength = -100;
-    currentNetworkStatus.lastUpdate = 0;
-    currentNetworkStatus.isAPMode = false;
+void DeviceHub::setEnableAPFallback(bool enable) {
+    enableAPFallback = enable;
+    log("AP fallback %s", enable ? "enabled" : "disabled");
 }
 
-DeviceHub::DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType,
-                     const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
-                     int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore, bool openAP)
-    : ssid(ssid), password(password), deviceName(deviceName), deviceType(deviceType), 
-      currentState(DeviceState::Normal), dtlsEnabled(false),
-      coap(nullptr), secureCoap(nullptr),
-      debugSerial(nullptr), debugEnabled(false),
-      apPassword(apPassword), wifiTimeoutMs(wifiTimeoutMs), enableAPFallback(enableAPFallback),
-      currentWiFiMode(WiFiMode::Offline), lastConnectionCheck(0), lastSignalCheck(0),
-      connectionCheckIntervalMs(connectionCheckIntervalMs), minSignalStrength(minSignalStrength),
-      currentSignalStrength(-100), apModeForced(false), 
-      totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(openAP),
-      forceSingleCore(forceSingleCore), isDualCore(false), detectedCores(1),
-      networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
-      networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
-      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
-    initializeNVS();
-    if (!this->openAPMode && strlen(this->apPassword) < 8) { this->apPassword = DEFAULT_AP_PASSWORD; this->openAPMode = false; log("Warning: AP password too short for secure mode, using default: %s", DEFAULT_AP_PASSWORD); }
-    if (this->connectionCheckIntervalMs < 5000) { this->connectionCheckIntervalMs = 5000; log("Warning: Connection check interval too short, using 5000ms"); }
-    if (this->minSignalStrength > -30 || this->minSignalStrength < -100) { this->minSignalStrength = DEFAULT_MIN_SIGNAL_STRENGTH; log("Warning: Invalid signal strength threshold, using default: %d dBm", DEFAULT_MIN_SIGNAL_STRENGTH); }
-    prefs.begin("devicehub", false);
-    apSSID = generateAPSSID();
-    mdnsHostname = generateMDNSHostname();
-    currentNetworkStatus.wifiMode = WiFiMode::Offline;
-    currentNetworkStatus.connected = false;
-    currentNetworkStatus.signalStrength = -100;
-    currentNetworkStatus.lastUpdate = 0;
-    currentNetworkStatus.isAPMode = false;
-    if (this->openAPMode) { log("Open (passwordless) AP mode enabled for easier device setup"); }
-}
-
-// AP-only constructor - forces AP mode without any WiFi connection attempts
-DeviceHub::DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP)
-    : ssid(""), password(""), deviceName(deviceName), deviceType(deviceType), 
-      currentState(DeviceState::Normal), dtlsEnabled(false),
-      coap(nullptr), secureCoap(nullptr),
-      debugSerial(nullptr), debugEnabled(false),
-      apPassword(apPassword), wifiTimeoutMs(0), enableAPFallback(false),
-      currentWiFiMode(WiFiMode::Offline), lastConnectionCheck(0), lastSignalCheck(0),
-      connectionCheckIntervalMs(DEFAULT_CONNECTION_CHECK_INTERVAL_MS), 
-      minSignalStrength(DEFAULT_MIN_SIGNAL_STRENGTH), currentSignalStrength(-100),
-      apModeForced(true), totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(openAP),
-      forceSingleCore(false), isDualCore(false), detectedCores(1),
-      networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
-      networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
-      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
-    initializeNVS();
-    if (!this->openAPMode && strlen(this->apPassword) < 8) { 
-        this->apPassword = DEFAULT_AP_PASSWORD; 
-        this->openAPMode = false; 
-        log("Warning: AP password too short for secure mode, using default: %s", DEFAULT_AP_PASSWORD); 
-    }
-    prefs.begin("devicehub", false);
-    apSSID = generateAPSSID();
-    mdnsHostname = generateMDNSHostname();
-    currentNetworkStatus.wifiMode = WiFiMode::Offline;
-    currentNetworkStatus.connected = false;
-    currentNetworkStatus.signalStrength = -100;
-    currentNetworkStatus.lastUpdate = 0;
-    currentNetworkStatus.isAPMode = false;
-    if (this->openAPMode) { 
-        log("AP-only mode: Open (passwordless) Access Point enabled"); 
+void DeviceHub::setAPPassword(const char* password) {
+    if (strlen(password) >= 8) {
+        apPassword = password;
+        log("AP password set");
     } else {
-        log("AP-only mode: Secured Access Point enabled"); 
+        log("Warning: AP password too short (min 8 chars), using default");
+        apPassword = DEFAULT_AP_PASSWORD;
+    }
+}
+
+void DeviceHub::setOpenAP(bool open) {
+    openAPMode = open;
+    log("Open AP mode %s", open ? "enabled" : "disabled");
+}
+
+void DeviceHub::setWiFiTimeout(int timeoutMs) {
+    if (timeoutMs >= 5000) {
+        wifiTimeoutMs = timeoutMs;
+        log("WiFi timeout set to %d ms", timeoutMs);
+    } else {
+        log("Warning: WiFi timeout too short (min 5000ms)");
+    }
+}
+
+void DeviceHub::setForceSingleCore(bool force) {
+    forceSingleCore = force;
+    log("Force single core: %s", force ? "yes" : "no");
+}
+
+void DeviceHub::setProductionCheckInterval(unsigned long intervalMs) {
+    if (intervalMs >= 60000) {  // Minimum 1 minute
+        productionCheckIntervalMs = intervalMs;
+        log("Production check interval set to %lu ms", intervalMs);
+    } else {
+        log("Warning: Production check interval too short (min 60000ms)");
     }
 }
 
@@ -304,12 +206,18 @@ void DeviceHub::begin(Print& serial) {
     setupCoAPResources();
     ensureDeviceUUID();
     
-    // Only start OTA helper if we have WiFi credentials (not AP-only mode)
-    if (!isAPOnlyMode() && strlen(ssid) > 0) {
+    // Only start OTA helper if we have WiFi connection (not AP-only mode)
+    if (!isAPOnlyMode() && !configuredNetworks.empty() && currentWiFiMode == WiFiMode::Station) {
         log("Starting OTA helper...");
-        otaHelper.start(ssid, password, deviceName, password, 3232, 115200);
+        // Use the connected network's credentials for OTA
+        for (const auto& network : configuredNetworks) {
+            if (network.ssid == connectedSSID) {
+                otaHelper.start(network.ssid.c_str(), network.password.c_str(), deviceName, network.password.c_str(), 3232, 115200);
+                break;
+            }
+        }
     } else {
-        log("Skipping OTA helper (AP-only mode or no WiFi credentials)");
+        log("Skipping OTA helper (AP-only mode or no WiFi connection)");
     }
     
     log("DeviceHub initialized successfully");
@@ -1189,91 +1097,15 @@ WiFiMode DeviceHub::getWiFiMode() const {
 // New private methods for AP functionality
 
 bool DeviceHub::attemptWiFiConnection() {
-    log("Attempting WiFi connection to '%s'... (Timeout: %dms)", ssid, wifiTimeoutMs);
-    
-    // Ensure WiFi is in correct mode and disconnected first
-    WiFi.mode(WIFI_OFF);
-    delay(100);
-    WiFi.mode(WIFI_STA);
-    delay(100);
-    
-    // Configure WiFi with explicit settings to prevent connection errors
-    WiFi.config((uint32_t)0x00000000, (uint32_t)0x00000000, (uint32_t)0x00000000, (uint32_t)0x00000000); // Use DHCP
-    WiFi.setAutoReconnect(false);
-    
-    // Begin connection with error checking
-    wl_status_t status = WiFi.begin(ssid, password);
-    if (status == WL_CONNECT_FAILED) {
-        log("WiFi.begin() failed immediately with WL_CONNECT_FAILED");
-        currentWiFiMode = WiFiMode::Offline;
-        currentSignalStrength = -100;
-        return false;
+    // Always use multi-WiFi connection since that's the only mode now
+    if (!configuredNetworks.empty()) {
+        return attemptMultiWiFiConnection();
     }
-    
-    unsigned long startTime = millis();
-    int attempts = 0;
-    
-    while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < wifiTimeoutMs) {
-        delay(500);
-        if (debugEnabled && debugSerial) {
-            debugSerial->print(".");
-        }
-        attempts++;
-        
-        // Check for specific error conditions
-        wl_status_t currentStatus = WiFi.status();
-        if (currentStatus == WL_CONNECT_FAILED || currentStatus == WL_CONNECTION_LOST) {
-            log("\nWiFi connection failed with status: %d", currentStatus);
-            break;
-        }
-        
-        // Prevent infinite loop with reasonable attempt limit
-        if (attempts > (wifiTimeoutMs / 500)) {
-            log("\nWiFi connection timeout after %d attempts", attempts);
-            break;
-        }
-    }
-    
-    wl_status_t finalStatus = WiFi.status();
-    if (finalStatus == WL_CONNECTED) {
-        currentWiFiMode = WiFiMode::Station;
-        currentSignalStrength = WiFi.RSSI();
-        log("\nWiFi connected successfully!");
-        log("IP address: %s", WiFi.localIP().toString().c_str());
-        log("Signal strength: %d dBm (%s)", currentSignalStrength, 
-            getSignalQualityDescription(currentSignalStrength).c_str());
-        log("MAC address: %s", WiFi.macAddress().c_str());
-        log("Gateway: %s", WiFi.gatewayIP().toString().c_str());
-        return true;
-    } else {
-        log("\nWiFi connection failed after %d attempts (%dms timeout).", attempts, wifiTimeoutMs);
-        log("Final WiFi status: %d", finalStatus);
-        
-        // Provide specific error messages
-        switch (finalStatus) {
-            case WL_NO_SSID_AVAIL:
-                log("Error: Network '%s' not found", ssid);
-                break;
-            case WL_CONNECT_FAILED:
-                log("Error: Connection failed - check password");
-                break;
-            case WL_CONNECTION_LOST:
-                log("Error: Connection was lost");
-                break;
-            case WL_DISCONNECTED:
-                log("Error: WiFi disconnected");
-                break;
-            default:
-                log("Error: Unknown WiFi error (status: %d)", finalStatus);
-                break;
-        }
-        
-        // Ensure WiFi is properly disconnected after failure
-        WiFi.disconnect(true);
-        currentWiFiMode = WiFiMode::Offline;
-        currentSignalStrength = -100;
-        return false;
-    }
+
+    log("No WiFi networks configured!");
+    currentWiFiMode = WiFiMode::Offline;
+    currentSignalStrength = -100;
+    return false;
 }
 
 void DeviceHub::setupAccessPoint() {
@@ -1440,10 +1272,13 @@ void DeviceHub::checkAndReconnect() {
         } else {
             // Connection is good, update signal strength
             currentSignalStrength = WiFi.RSSI();
-            log("Periodic check: WiFi OK - IP: %s, Signal: %d dBm (%s)", 
+            log("Periodic check: WiFi OK - IP: %s, Signal: %d dBm (%s)",
                 WiFi.localIP().toString().c_str(),
                 currentSignalStrength,
                 getSignalQualityDescription(currentSignalStrength).c_str());
+
+            // Check if we should switch to production network
+            checkForProductionNetwork();
         }
     }
     
@@ -1961,7 +1796,7 @@ bool DeviceHub::isAPOpen() const {
 }
 
 bool DeviceHub::isAPOnlyMode() const {
-    return apModeForced && (strlen(ssid) == 0 || strcmp(ssid, "") == 0);
+    return apModeForced && configuredNetworks.empty();
 }
 
 void DeviceHub::initializeNVS() {
@@ -1992,5 +1827,315 @@ void DeviceHub::sendEmergency(const String& message) {
     serializeJson(doc, payload);
     // NON-confirmable is fine for alarms; hub listens on 5683 and joins 224.0.1.187
     sendCoAPMessage(payload, COAP_NONCON);
+}
+
+// =============================================
+// Multi-WiFi Support Methods
+// =============================================
+
+void DeviceHub::addNetwork(const String& ssid, const String& password,
+                           WiFiEnvironment env, int priority) {
+    WiFiNetwork network;
+    network.ssid = ssid;
+    network.password = password;
+    network.environment = env;
+    network.priority = priority;
+    configuredNetworks.push_back(network);
+    log("Added network: %s (env: %s, priority: %d)",
+        ssid.c_str(),
+        env == WiFiEnvironment::Production ? "production" :
+        env == WiFiEnvironment::Development ? "development" : "unknown",
+        priority);
+}
+
+void DeviceHub::addNetwork(const String& ssid, const String& password,
+                           const String& envStr, int priority) {
+    addNetwork(ssid, password, parseEnvironment(envStr), priority);
+}
+
+WiFiEnvironment DeviceHub::parseEnvironment(const String& envStr) {
+    String lower = envStr;
+    lower.toLowerCase();
+    if (lower == "production" || lower == "prod" || lower == "p") {
+        return WiFiEnvironment::Production;
+    } else if (lower == "development" || lower == "dev" || lower == "d") {
+        return WiFiEnvironment::Development;
+    }
+    return WiFiEnvironment::Unknown;
+}
+
+void DeviceHub::autoConfigureNetworks() {
+    log("Auto-configuring WiFi networks from build defines...");
+
+#ifdef WIFI_MULTI_ENABLED
+    // Multi-network mode - add all configured networks
+
+    #ifdef WIFI_1_SSID
+        #ifdef WIFI_1_ENV
+            addNetwork(WIFI_1_SSID, WIFI_1_PASSWORD, WIFI_1_ENV, 1);
+        #else
+            addNetwork(WIFI_1_SSID, WIFI_1_PASSWORD, WiFiEnvironment::Production, 1);
+        #endif
+    #endif
+
+    #ifdef WIFI_2_SSID
+        #ifdef WIFI_2_ENV
+            addNetwork(WIFI_2_SSID, WIFI_2_PASSWORD, WIFI_2_ENV, 2);
+        #else
+            addNetwork(WIFI_2_SSID, WIFI_2_PASSWORD, WiFiEnvironment::Development, 2);
+        #endif
+    #endif
+
+    #ifdef WIFI_3_SSID
+        #ifdef WIFI_3_ENV
+            addNetwork(WIFI_3_SSID, WIFI_3_PASSWORD, WIFI_3_ENV, 3);
+        #else
+            addNetwork(WIFI_3_SSID, WIFI_3_PASSWORD, WiFiEnvironment::Unknown, 3);
+        #endif
+    #endif
+
+    #ifdef WIFI_4_SSID
+        #ifdef WIFI_4_ENV
+            addNetwork(WIFI_4_SSID, WIFI_4_PASSWORD, WIFI_4_ENV, 4);
+        #else
+            addNetwork(WIFI_4_SSID, WIFI_4_PASSWORD, WiFiEnvironment::Unknown, 4);
+        #endif
+    #endif
+
+    #ifdef WIFI_5_SSID
+        #ifdef WIFI_5_ENV
+            addNetwork(WIFI_5_SSID, WIFI_5_PASSWORD, WIFI_5_ENV, 5);
+        #else
+            addNetwork(WIFI_5_SSID, WIFI_5_PASSWORD, WiFiEnvironment::Unknown, 5);
+        #endif
+    #endif
+
+#else
+    // Legacy single network mode
+    #ifdef WIFI_SSID
+        #ifdef WIFI_PASSWORD
+            addNetwork(WIFI_SSID, WIFI_PASSWORD, WiFiEnvironment::Production, 1);
+        #else
+            addNetwork(WIFI_SSID, "", WiFiEnvironment::Production, 1);
+        #endif
+    #endif
+#endif
+
+    log("Configured %d WiFi network(s)", configuredNetworks.size());
+}
+
+void DeviceHub::scanAndSortNetworks() {
+    log("Scanning for available networks...");
+
+    int n = WiFi.scanNetworks();
+    log("Found %d networks", n);
+
+    // Create a map of SSID -> signal strength
+    std::map<String, int> availableNetworks;
+    for (int i = 0; i < n; i++) {
+        String ssidFound = WiFi.SSID(i);
+        int rssi = WiFi.RSSI(i);
+        if (availableNetworks.find(ssidFound) == availableNetworks.end() ||
+            availableNetworks[ssidFound] < rssi) {
+            availableNetworks[ssidFound] = rssi;
+        }
+        log("  %s: %d dBm", ssidFound.c_str(), rssi);
+    }
+
+    // Sort networks: available first (by priority), then unavailable
+    std::sort(configuredNetworks.begin(), configuredNetworks.end(),
+        [&availableNetworks](const WiFiNetwork& a, const WiFiNetwork& b) {
+            bool aAvailable = availableNetworks.find(a.ssid) != availableNetworks.end();
+            bool bAvailable = availableNetworks.find(b.ssid) != availableNetworks.end();
+
+            // Available networks come first
+            if (aAvailable != bAvailable) {
+                return aAvailable;
+            }
+
+            // Both available or both unavailable - sort by priority
+            return a.priority < b.priority;
+        });
+
+    WiFi.scanDelete();
+}
+
+bool DeviceHub::tryConnectToNetwork(const WiFiNetwork& network, unsigned long timeoutMs) {
+    log("Trying to connect to: %s", network.ssid.c_str());
+
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    delay(100);
+
+    WiFi.begin(network.ssid.c_str(), network.password.c_str());
+
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < timeoutMs) {
+        delay(250);
+        if (debugEnabled && debugSerial) {
+            debugSerial->print(".");
+        }
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (debugEnabled && debugSerial) {
+            debugSerial->println();
+        }
+        log("Connected to %s!", network.ssid.c_str());
+        log("IP: %s, RSSI: %d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+
+        // Update state
+        connectedSSID = network.ssid;
+        currentEnvironment = network.environment;
+        currentWiFiMode = WiFiMode::Station;
+        currentSignalStrength = WiFi.RSSI();
+
+        return true;
+    }
+
+    if (debugEnabled && debugSerial) {
+        debugSerial->println();
+    }
+    log("Failed to connect to %s (status: %d)", network.ssid.c_str(), WiFi.status());
+    return false;
+}
+
+bool DeviceHub::attemptMultiWiFiConnection() {
+    if (configuredNetworks.empty()) {
+        log("No networks configured for multi-WiFi!");
+        return false;
+    }
+
+    // Scan and sort networks by availability and priority
+    scanAndSortNetworks();
+
+    // Calculate timeout per network
+    unsigned long perNetworkTimeout = wifiTimeoutMs / configuredNetworks.size();
+    if (perNetworkTimeout < 5000) {
+        perNetworkTimeout = 5000;  // Minimum 5 seconds per network
+    }
+
+    // Try each network in order
+    for (const auto& network : configuredNetworks) {
+        if (tryConnectToNetwork(network, perNetworkTimeout)) {
+            log("=== Connected to %s ===", network.ssid.c_str());
+            log("Environment: %s", getCurrentEnvironmentString().c_str());
+            log("IP Address: %s", WiFi.localIP().toString().c_str());
+            log("Signal: %d dBm", WiFi.RSSI());
+            return true;
+        }
+    }
+
+    log("Failed to connect to any configured network");
+    return false;
+}
+
+WiFiEnvironment DeviceHub::getCurrentEnvironment() const {
+    return currentEnvironment;
+}
+
+String DeviceHub::getCurrentEnvironmentString() const {
+    switch (currentEnvironment) {
+        case WiFiEnvironment::Production:
+            return "production";
+        case WiFiEnvironment::Development:
+            return "development";
+        default:
+            return "unknown";
+    }
+}
+
+bool DeviceHub::isProduction() const {
+    return currentEnvironment == WiFiEnvironment::Production;
+}
+
+bool DeviceHub::isDevelopment() const {
+    return currentEnvironment == WiFiEnvironment::Development;
+}
+
+String DeviceHub::getConnectedSSID() const {
+    return connectedSSID;
+}
+
+const std::vector<WiFiNetwork>& DeviceHub::getConfiguredNetworks() const {
+    return configuredNetworks;
+}
+
+void DeviceHub::checkForProductionNetwork() {
+    // Only check if we're connected to a non-production network
+    if (currentEnvironment == WiFiEnvironment::Production ||
+        currentWiFiMode != WiFiMode::Station ||
+        WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    // Check if it's time to scan for production network
+    unsigned long currentTime = millis();
+    if (currentTime - lastProductionCheck < productionCheckIntervalMs) {
+        return;
+    }
+    lastProductionCheck = currentTime;
+
+    log("Checking if production network is available (currently on %s - %s)...",
+        connectedSSID.c_str(), getCurrentEnvironmentString().c_str());
+
+    // Find the production network(s) in our config
+    WiFiNetwork* productionNetwork = nullptr;
+    for (auto& network : configuredNetworks) {
+        if (network.environment == WiFiEnvironment::Production) {
+            productionNetwork = &network;
+            break;  // Use the first (highest priority) production network
+        }
+    }
+
+    if (!productionNetwork) {
+        log("No production network configured");
+        return;
+    }
+
+    // Quick scan to see if production network is available
+    log("Scanning for production network: %s", productionNetwork->ssid.c_str());
+    int n = WiFi.scanNetworks(false, false, false, 300);  // Quick scan, 300ms per channel
+
+    bool productionAvailable = false;
+    int productionRssi = -100;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == productionNetwork->ssid) {
+            productionAvailable = true;
+            productionRssi = WiFi.RSSI(i);
+            break;
+        }
+    }
+    WiFi.scanDelete();
+
+    if (!productionAvailable) {
+        log("Production network '%s' not available yet", productionNetwork->ssid.c_str());
+        return;
+    }
+
+    log("Production network '%s' is available (signal: %d dBm)! Switching...",
+        productionNetwork->ssid.c_str(), productionRssi);
+
+    // Disconnect from current network and connect to production
+    WiFi.disconnect(true);
+    delay(100);
+
+    if (tryConnectToNetwork(*productionNetwork, 10000)) {
+        log("=== Switched to PRODUCTION network: %s ===", productionNetwork->ssid.c_str());
+        log("IP Address: %s", WiFi.localIP().toString().c_str());
+        log("Signal: %d dBm", WiFi.RSSI());
+        setupMDNS();  // Re-setup mDNS with new connection
+    } else {
+        // Failed to connect to production, try to reconnect to any available network
+        log("Failed to switch to production, reconnecting to any available network...");
+        if (!attemptMultiWiFiConnection()) {
+            log("Failed to reconnect to any network!");
+            if (enableAPFallback) {
+                setupAccessPoint();
+                setupMDNS();
+            }
+        }
+    }
 }
 

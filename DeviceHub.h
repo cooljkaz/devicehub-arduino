@@ -65,6 +65,21 @@ enum class WiFiMode {
     Offline       // No connection
 };
 
+// Environment types for multi-WiFi support
+enum class WiFiEnvironment {
+    Production,
+    Development,
+    Unknown
+};
+
+// WiFi network configuration for multi-network support
+struct WiFiNetwork {
+    String ssid;
+    String password;
+    WiFiEnvironment environment;
+    int priority;  // Lower number = higher priority
+};
+
 struct ActionParameter {
     String name;
     String type;
@@ -139,26 +154,19 @@ public:
         int retries = 0;
     };
 
-    // Enhanced constructor with dual-core support
-    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType = "esp32");
-    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
-              const char* apPassword, int wifiTimeoutMs = DEFAULT_WIFI_TIMEOUT_MS, bool enableAPFallback = true);
-    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
-              const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
-              int connectionCheckIntervalMs, int minSignalStrength = DEFAULT_MIN_SIGNAL_STRENGTH);
-    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
-              const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
-              int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore);
-    
-    // New constructor with passwordless AP option
-    DeviceHub(const char* ssid, const char* password, const char* deviceName, const char* deviceType, 
-              const char* apPassword, int wifiTimeoutMs, bool enableAPFallback, 
-              int connectionCheckIntervalMs, int minSignalStrength, bool forceSingleCore, bool openAP);
-    
-    // Constructor that forces AP-only mode (no WiFi connection attempts)
-    DeviceHub(const char* deviceName, const char* deviceType, const char* apPassword, bool openAP);
-              
+    // Single constructor - uses networks configured via build defines (WIFI_1_SSID, etc.)
+    DeviceHub(const char* deviceName);
+
     ~DeviceHub();
+
+    // Configuration setters (call before begin())
+    void setDeviceType(const char* type);           // Default: "esp32"
+    void setEnableAPFallback(bool enable);          // Default: false
+    void setAPPassword(const char* password);       // Default: "devicehub123"
+    void setOpenAP(bool open);                      // Default: false (password-protected)
+    void setWiFiTimeout(int timeoutMs);             // Default: 20000ms
+    void setForceSingleCore(bool force);            // Default: false (auto-detect)
+    void setProductionCheckInterval(unsigned long intervalMs);  // Default: 300000ms (5 min)
     void begin();
     void begin(Print& serial);
     void loop();
@@ -244,9 +252,20 @@ public:
     int getCoreCount() const;                 // Returns detected core count
     bool isNetworkTaskRunning() const;        // Returns true if network task is active
 
+    // Multi-WiFi methods
+    void addNetwork(const String& ssid, const String& password,
+                    WiFiEnvironment env = WiFiEnvironment::Production, int priority = 99);
+    void addNetwork(const String& ssid, const String& password,
+                    const String& envStr, int priority = 99);
+    void autoConfigureNetworks();             // Load networks from build defines
+    WiFiEnvironment getCurrentEnvironment() const;
+    String getCurrentEnvironmentString() const;
+    bool isProduction() const;                // Returns true if connected to production network
+    bool isDevelopment() const;               // Returns true if connected to development network
+    String getConnectedSSID() const;          // Returns SSID of connected network
+    const std::vector<WiFiNetwork>& getConfiguredNetworks() const;
+
 private:
-    const char* ssid;
-    const char* password;
     const char* deviceName;
     const char* deviceType;
     String deviceUUID;
@@ -288,6 +307,14 @@ private:
     unsigned long totalReconnectionAttempts;
     unsigned long successfulReconnections;
     bool openAPMode;  // New: true for passwordless AP
+
+    // Multi-WiFi support members
+    std::vector<WiFiNetwork> configuredNetworks;
+    WiFiEnvironment currentEnvironment;
+    String connectedSSID;
+    bool useMultiWiFi;  // True when using multi-network mode
+    unsigned long productionCheckIntervalMs;  // How often to check for production network when on dev
+    unsigned long lastProductionCheck;        // Last time we checked for production network
 
     // Dual-core support members
     bool forceSingleCore;
@@ -344,6 +371,13 @@ private:
     // Enhanced WiFi monitoring methods
     void monitorSignalStrength();
     String getSignalQualityDescription(int rssi) const;
+
+    // Multi-WiFi helper methods
+    WiFiEnvironment parseEnvironment(const String& envStr);
+    bool tryConnectToNetwork(const WiFiNetwork& network, unsigned long timeoutMs);
+    bool attemptMultiWiFiConnection();
+    void scanAndSortNetworks();
+    void checkForProductionNetwork();  // Switch to production if available when on dev
 
     // Dual-core specific methods
     bool detectAndSetupDualCore();
