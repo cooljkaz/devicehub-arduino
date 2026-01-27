@@ -90,6 +90,9 @@ struct ActionParameter {
 };
 
 // Inter-core communication structures
+// NOTE: Do NOT use String, JsonDocument, or other objects with internal heap pointers here!
+// FreeRTOS queues use memcpy which breaks objects with dynamic memory.
+// Use fixed-size char arrays instead.
 struct NetworkCommand {
     enum Type {
         WIFI_RECONNECT,
@@ -100,8 +103,7 @@ struct NetworkCommand {
         CHECK_CONNECTION
     };
     Type type;
-    String data;
-    JsonDocument payload;
+    char data[64];  // Fixed-size buffer instead of String
 };
 
 struct NetworkStatus {
@@ -109,7 +111,7 @@ struct NetworkStatus {
     bool connected;
     int signalStrength;
     IPAddress currentIP;
-    String lastError;
+    char lastError[64];  // Fixed-size buffer instead of String
     unsigned long lastUpdate;
     bool isAPMode;
 };
@@ -129,7 +131,7 @@ public:
     struct Event {
         String id;
         String name;
-        JsonObject dataSchema;
+        String dataSchemaJson;  // Serialized JSON string (stores a copy, not a reference)
     };
 
     struct Setting {
@@ -358,11 +360,13 @@ private:
     void handleEmergencyEnd();
   
     bool mdnsRunning = false;
+    bool emergencyUdpInitialized = false;  // Track if UDP socket has been initialized
 
     // New private methods for AP functionality
     bool attemptWiFiConnection();
     void setupAccessPoint();
     void setupStationMode();
+    void initializeUdpSockets();  // Initialize UDP sockets after TCP/IP stack is ready
     void setupMDNS();
     void checkAndReconnect();
     String generateAPSSID() const;

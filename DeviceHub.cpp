@@ -6,24 +6,46 @@
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include <esp_err.h>
-#include <lwip/tcpip.h>
-#include <esp_event.h>
-#include <esp_netif.h>
-#include <esp_wifi.h>
 #include <algorithm>
 
-Preferences prefs;
-const IPAddress DeviceHub::BROADCAST_IP(255, 255, 255, 255);
-const IPAddress DeviceHub::COAP_MULTICAST_IP(224, 0, 1, 187);
-const char* DeviceHub::API_VERSION = DEVICEHUB_VERSION_2;
+// NOTE: We avoid global object constructors that could crash on ESP32-S3
+// These are allocated dynamically in begin() instead
+Preferences* prefsPtr = nullptr;
+WiFiUDP* udpPtr = nullptr;
 
-// UDP instances only
-WiFiUDP udp;
+// Static members
+// NOTE: On ESP32-S3, global IPAddress constructors can crash before Arduino runtime initializes.
+// We use a lazy-initialization pattern for these IP addresses.
+static IPAddress* broadcastIPPtr = nullptr;
+static IPAddress* coapMulticastIPPtr = nullptr;
+
+// Lazy-initialized getter for BROADCAST_IP
+static IPAddress& getBroadcastIP() {
+    if (!broadcastIPPtr) {
+        broadcastIPPtr = new IPAddress(255, 255, 255, 255);
+    }
+    return *broadcastIPPtr;
+}
+
+// Lazy-initialized getter for COAP_MULTICAST_IP
+static IPAddress& getCoapMulticastIP() {
+    if (!coapMulticastIPPtr) {
+        coapMulticastIPPtr = new IPAddress(224, 0, 1, 187);
+    }
+    return *coapMulticastIPPtr;
+}
+
+// These must be defined but are not used directly - use the getter functions instead
+const IPAddress DeviceHub::BROADCAST_IP(0, 0, 0, 0);  // Placeholder - use getBroadcastIP()
+const IPAddress DeviceHub::COAP_MULTICAST_IP(0, 0, 0, 0);  // Placeholder - use getCoapMulticastIP()
+const char* DeviceHub::API_VERSION = DEVICEHUB_VERSION_2;
 
 // Forward declaration for the helper function
 String getPathFromPacket(CoapPacket& packet);
 
 // Single constructor - uses networks configured via build defines
+// NOTE: We avoid heavy initialization here (NVS, WiFi, etc.) because global constructors
+// run before Arduino's setup() and can crash on ESP32-S3 and other variants.
 DeviceHub::DeviceHub(const char* deviceName)
     : deviceName(deviceName), deviceType("esp32"),
       currentState(DeviceState::Normal), dtlsEnabled(false),
@@ -40,18 +62,9 @@ DeviceHub::DeviceHub(const char* deviceName)
       networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
       networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
       cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
-    initializeNVS();
-    prefs.begin("devicehub", false);
-    apSSID = generateAPSSID();
-    mdnsHostname = generateMDNSHostname();
-    currentNetworkStatus.wifiMode = WiFiMode::Offline;
-    currentNetworkStatus.connected = false;
-    currentNetworkStatus.signalStrength = -100;
-    currentNetworkStatus.lastUpdate = 0;
-    currentNetworkStatus.isAPMode = false;
-
-    // Auto-configure networks from build defines
-    autoConfigureNetworks();
+    // MINIMAL constructor - do nothing here that could crash on ESP32-S3
+    // All initialization is deferred to begin() which runs during setup()
+    // after the Arduino runtime is fully initialized.
 }
 
 // Configuration setters (call before begin())
@@ -132,27 +145,41 @@ void DeviceHub::begin(Print& serial) {
     debugEnabled = true;
     log("DeviceHub::begin() called - Initializing core systems...");
 
-#if defined(ESP32)
-    // Initialize TCP/IP stack and default event loop ONCE.
-    esp_err_t err = esp_netif_init();
-    if (err != ESP_OK) {
-        log("FATAL: esp_netif_init() failed: %s", esp_err_to_name(err));
-        return; // Cannot proceed
+    // Allocate global objects now (deferred from static initialization for ESP32-S3 compatibility)
+    if (!prefsPtr) {
+        prefsPtr = new Preferences();
     }
-    err = esp_event_loop_create_default();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) { // ESP_ERR_INVALID_STATE means it's already created
-        log("FATAL: esp_event_loop_create_default() failed: %s", esp_err_to_name(err));
-        return; // Cannot proceed
+    if (!udpPtr) {
+        udpPtr = new WiFiUDP();
     }
-#endif
 
-    // UDP Socket for emergency broadcasts (port 8890)
-    // Note: Discovery now uses standard CoAP multicast on port 5683
-    if (emergencyUdp.begin(EMERGENCY_PORT)) {
-        log("Emergency UDP: Bound to port %d", EMERGENCY_PORT);
-    } else {
-        log("Emergency UDP: Failed to bind");
-    }
+    // Initialize NVS (Non-Volatile Storage) first - this is critical for Preferences
+    initializeNVS();
+
+    // Now open Preferences namespace (after NVS is initialized)
+    prefsPtr->begin("devicehub", false);
+
+    // Generate AP SSID and mDNS hostname (deferred from constructor for ESP32-S3 compatibility)
+    apSSID = generateAPSSID();
+    mdnsHostname = generateMDNSHostname();
+    log("AP SSID: %s, mDNS: %s", apSSID.c_str(), mdnsHostname.c_str());
+
+    // Initialize network status struct
+    currentNetworkStatus.wifiMode = WiFiMode::Offline;
+    currentNetworkStatus.connected = false;
+    currentNetworkStatus.signalStrength = -100;
+    currentNetworkStatus.lastUpdate = 0;
+    currentNetworkStatus.isAPMode = false;
+
+    // Auto-configure networks from build defines
+    autoConfigureNetworks();
+
+    // NOTE: Do NOT call esp_netif_init() or esp_event_loop_create_default() here!
+    // The Arduino ESP32 WiFi library handles TCP/IP and event loop initialization internally.
+    // Calling them manually can cause conflicts or double-initialization crashes on ESP32-S3.
+
+    // NOTE: UDP sockets cannot be created until after WiFi.begin() initializes the TCP/IP stack.
+    // Emergency UDP will be initialized after WiFi connection is established.
 
     // Detect and setup dual-core if available
     if (detectAndSetupDualCore()) {
@@ -184,7 +211,7 @@ void DeviceHub::begin(Print& serial) {
     }
     
     log("Creating CoAP instance...");
-    coap = new Coap(udp, 1500);
+    coap = new Coap(*udpPtr, 1500);
     log("Starting CoAP instance on port %d...", COAP_PORT);
     if (!coap->start(COAP_PORT)) {
         log("Error: Failed to start CoAP server instance!");
@@ -195,7 +222,7 @@ void DeviceHub::begin(Print& serial) {
 
     if (dtlsEnabled) {
         log("Creating/Starting Secure CoAP instance...");
-        secureCoap = new Coap(udp, 1500);
+        secureCoap = new Coap(*udpPtr, 1500);
         if (!secureCoap->start(SECURE_COAP_PORT)) { 
             log("Error: Failed to start Secure CoAP instance!");
         } else {
@@ -618,8 +645,12 @@ String DeviceHub::getDeviceInfo() {
         JsonObject eventObj = eventsArray.add<JsonObject>();
         eventObj["id"] = event.id;
         eventObj["name"] = event.name;
-        // Re-enable schema
-        eventObj["dataSchema"] = event.dataSchema;
+        // Parse the serialized schema back into a JsonObject
+        if (event.dataSchemaJson.length() > 0) {
+            JsonDocument schemaDoc;
+            deserializeJson(schemaDoc, event.dataSchemaJson);
+            eventObj["dataSchema"] = schemaDoc.as<JsonObject>();
+        }
     }
 
     JsonObject status = doc["status"].to<JsonObject>();
@@ -696,7 +727,7 @@ void DeviceHub::sendDeviceInfo() {
 
     // Send device info to CoAP multicast group (224.0.1.187)
     // This allows the hub daemon to receive periodic updates
-    uint16_t messageId = coap->send(COAP_MULTICAST_IP, COAP_PORT, "device/info",
+    uint16_t messageId = coap->send(getCoapMulticastIP(), COAP_PORT, "device/info",
                                     COAP_NONCON,
                                     COAP_POST, NULL, 0,
                                     (uint8_t*)deviceInfo.c_str(), deviceInfo.length(),
@@ -739,7 +770,7 @@ void DeviceHub::sendCoAPMessage(const String& payload, COAP_TYPE messageType) {
         return;
     }
     log("Attempting to send CoAP message (Type: %d, Payload size: %d)...", messageType, payload.length());
-    uint16_t messageId = coap->send(BROADCAST_IP, COAP_PORT, "message", 
+    uint16_t messageId = coap->send(getBroadcastIP(), COAP_PORT, "message", 
                                     messageType, COAP_POST, NULL, 0,
                                     (uint8_t*)payload.c_str(), payload.length(),
                                     COAP_APPLICATION_JSON);
@@ -803,15 +834,15 @@ void DeviceHub::registerAction(const String& actionId, const String& actionName,
 }
 
 void DeviceHub::savePersistentData(const char* key, const String& value) {
-    prefs.begin("device-hub", false);
-    prefs.putString(key, value);
-    prefs.end();
+    prefsPtr->begin("device-hub", false);
+    prefsPtr->putString(key, value);
+    prefsPtr->end();
 }
 
 String DeviceHub::loadPersistentData(const char* key, const String& defaultValue) {
-    prefs.begin("device-hub", false);
-    String value = prefs.getString(key, defaultValue);
-    prefs.end();
+    prefsPtr->begin("device-hub", false);
+    String value = prefsPtr->getString(key, defaultValue);
+    prefsPtr->end();
     return value;
 }
 
@@ -819,7 +850,13 @@ void DeviceHub::registerEvent(const String& eventId, const String& eventName, co
     Event event;
     event.id = eventId;
     event.name = eventName;
-    event.dataSchema = schema;
+    // Serialize the schema to a string to avoid dangling JsonObject reference
+    // (JsonObject doesn't own memory - the original document might go out of scope)
+    if (!schema.isNull()) {
+        serializeJson(schema, event.dataSchemaJson);
+    } else {
+        event.dataSchemaJson = "{}";
+    }
     events[eventId] = event;
 }
 
@@ -842,9 +879,9 @@ void DeviceHub::setDeviceUUID(const String& uuid) {
         deviceUUID = uuid;
         
         // Optionally store the manually set UUID
-        prefs.begin("devicehub", false);
-        prefs.putString("device_uuid", deviceUUID);
-        prefs.end();
+        prefsPtr->begin("devicehub", false);
+        prefsPtr->putString("device_uuid", deviceUUID);
+        prefsPtr->end();
     } else {
         Serial.println("Invalid UUID format. UUID not set.");
     }
@@ -857,9 +894,9 @@ void DeviceHub::ensureDeviceUUID() {
     }
     
     // If not, try to load from persistent storage
-    prefs.begin("devicehub", false);
-    deviceUUID = prefs.getString("device_uuid", "");
-    prefs.end();
+    prefsPtr->begin("devicehub", false);
+    deviceUUID = prefsPtr->getString("device_uuid", "");
+    prefsPtr->end();
     
     // If still not valid, generate a new UUID
     if (!isUUIDValid()) {
@@ -900,9 +937,9 @@ void DeviceHub::generateAndStoreUUID() {
     deviceUUID = String(uuidStr);
     
     // Store in persistent storage
-    prefs.begin("devicehub", false);
-    prefs.putString("device_uuid", deviceUUID);
-    prefs.end();
+    prefsPtr->begin("devicehub", false);
+    prefsPtr->putString("device_uuid", deviceUUID);
+    prefsPtr->end();
 }
 
 void DeviceHub::sendPeriodicUpdate() {
@@ -1178,7 +1215,10 @@ void DeviceHub::setupAccessPoint() {
             }
             
             // Skip AP visibility check - scanning interferes with AP operation on ESP32
-            
+
+            // Initialize UDP sockets now that TCP/IP stack is ready
+            initializeUdpSockets();
+
         } else {
             log("ERROR: AP started but WiFi mode incorrect!");
             currentWiFiMode = WiFiMode::Offline;
@@ -1194,6 +1234,22 @@ void DeviceHub::setupStationMode() {
     log("Setting up WiFi Station mode...");
     currentWiFiMode = WiFiMode::Station;
     // WiFi is already connected from attemptWiFiConnection()
+
+    // Initialize UDP sockets now that TCP/IP stack is ready
+    initializeUdpSockets();
+}
+
+void DeviceHub::initializeUdpSockets() {
+    // Initialize emergency UDP socket (port 8890)
+    // This must be called AFTER WiFi.begin() initializes the TCP/IP stack
+    if (!emergencyUdpInitialized) {
+        if (emergencyUdp.begin(EMERGENCY_PORT)) {
+            log("Emergency UDP: Bound to port %d", EMERGENCY_PORT);
+            emergencyUdpInitialized = true;
+        } else {
+            log("Emergency UDP: Failed to bind to port %d", EMERGENCY_PORT);
+        }
+    }
 }
 
 void DeviceHub::setupMDNS() {
@@ -1525,7 +1581,7 @@ void DeviceHub::stopNetworkTask() {
     // Send stop command to task
     NetworkCommand stopCommand;
     stopCommand.type = NetworkCommand::CHECK_CONNECTION; // Use as stop signal
-    stopCommand.data = "STOP";
+    strcpy(stopCommand.data, "STOP");
     
     if (commandQueue) {
         xQueueSend(commandQueue, &stopCommand, portMAX_DELAY);
@@ -1583,6 +1639,7 @@ void DeviceHub::handleNetworkOperations() {
     
     // Update initial status
     NetworkStatus status;
+    memset(&status, 0, sizeof(status));  // Zero-initialize all fields including char arrays
     status.wifiMode = currentWiFiMode;
     status.connected = (currentWiFiMode == WiFiMode::Station) ? (WiFi.status() == WL_CONNECTED) : true;
     status.signalStrength = currentSignalStrength;
@@ -1605,7 +1662,7 @@ void DeviceHub::handleNetworkOperations() {
         // Check for commands from main core
         NetworkCommand command;
         if (commandQueue && xQueueReceive(commandQueue, &command, 10) == pdTRUE) {
-            if (command.data == "STOP") {
+            if (strcmp(command.data, "STOP") == 0) {
                 log("Network task received stop command");
                 break;
             }
@@ -1695,12 +1752,14 @@ bool DeviceHub::sendNetworkCommand(NetworkCommand::Type type, const String& data
     if (!isDualCore || !commandQueue) {
         return false;
     }
-    
+
     NetworkCommand command;
     command.type = type;
-    command.data = data;
-    command.payload = payload;
-    
+    // Copy String to fixed char array (truncate if needed)
+    strncpy(command.data, data.c_str(), sizeof(command.data) - 1);
+    command.data[sizeof(command.data) - 1] = '\0';
+    // Note: payload parameter is ignored - JsonDocument cannot be safely passed through FreeRTOS queues
+
     return xQueueSend(commandQueue, &command, pdMS_TO_TICKS(100)) == pdTRUE;
 #else
     return false;
