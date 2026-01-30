@@ -964,6 +964,12 @@ WiFiClass DeviceHub::getWiFi() {
 }
 
 void DeviceHub::handleEmergencyPacket() {
+    // Don't try to parse packets if UDP socket hasn't been initialized yet
+    // (TCP/IP stack isn't ready until after WiFi.begin() completes)
+    if (!emergencyUdpInitialized) {
+        return;
+    }
+
     int packetSize = emergencyUdp.parsePacket();
     if (packetSize) {
         char incomingPacket[255];
