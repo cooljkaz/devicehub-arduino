@@ -81,12 +81,15 @@ struct WiFiNetwork {
 };
 
 struct ActionParameter {
-    String name;
-    String type;
-    String unit;
-    float defaultValue;
-    float min;
-    float max;
+    String name;        // Parameter ID (e.g., "code", "brightness")
+    String type;        // "string", "number", "boolean"
+    String unit;        // Unit label (e.g., "%", "ms") or empty
+    float defaultValue; // Default value for numbers
+    float min;          // Min value for numbers, or min length for strings
+    float max;          // Max value for numbers, or max length for strings
+    String label;       // Human-readable label (e.g., "Enter Code")
+    String description; // Help text (e.g., "4-digit code")
+    String defaultString; // Default value for strings
 };
 
 // Inter-core communication structures

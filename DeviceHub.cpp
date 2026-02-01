@@ -632,10 +632,18 @@ String DeviceHub::getDeviceInfo() {
             JsonObject paramObj = parametersArray.add<JsonObject>();
             paramObj["name"] = param.name;
             paramObj["type"] = param.type;
-            paramObj["unit"] = param.unit;
-            paramObj["defaultValue"] = param.defaultValue;
-            paramObj["min"] = param.min;
-            paramObj["max"] = param.max;
+            if (param.unit.length() > 0) paramObj["unit"] = param.unit;
+            if (param.type == "number") {
+                paramObj["defaultValue"] = param.defaultValue;
+                paramObj["min"] = param.min;
+                paramObj["max"] = param.max;
+            } else if (param.type == "string") {
+                if (param.defaultString.length() > 0) paramObj["defaultValue"] = param.defaultString;
+                if (param.min > 0) paramObj["minLength"] = (int)param.min;
+                if (param.max > 0) paramObj["maxLength"] = (int)param.max;
+            }
+            if (param.label.length() > 0) paramObj["label"] = param.label;
+            if (param.description.length() > 0) paramObj["description"] = param.description;
         }
     }
 
@@ -1642,7 +1650,18 @@ void DeviceHub::handleNetworkOperations() {
     if (currentWiFiMode != WiFiMode::Offline) {
         setupMDNS();
     }
-    
+
+    // Start OTA helper in dual-core mode after WiFi connects
+    if (currentWiFiMode == WiFiMode::Station && !configuredNetworks.empty()) {
+        log("Network Task: Starting OTA helper...");
+        for (const auto& network : configuredNetworks) {
+            if (network.ssid == connectedSSID) {
+                otaHelper.start(network.ssid.c_str(), network.password.c_str(), deviceName, network.password.c_str(), 3232, 115200);
+                break;
+            }
+        }
+    }
+
     // Update initial status
     NetworkStatus status;
     memset(&status, 0, sizeof(status));  // Zero-initialize all fields including char arrays
