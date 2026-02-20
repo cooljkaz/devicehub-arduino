@@ -61,7 +61,10 @@ DeviceHub::DeviceHub(const char* deviceName)
       forceSingleCore(false), isDualCore(false), detectedCores(1),
       networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
       networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
-      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false) {
+      cachedWiFiMode(WiFiMode::Offline), cachedConnected(false), cachedSignalStrength(-100), cachedIsAPMode(false),
+      bleBeaconConfigured(false), bleBeaconActive(false),
+      bleBeaconMajor(0), bleBeaconMinor(0), bleBeaconTxPower(-59),
+      firmwareVersion("0.0.0"), otaUpdatePending(false) {
     // MINIMAL constructor - do nothing here that could crash on ESP32-S3
     // All initialization is deferred to begin() which runs during setup()
     // after the Arduino runtime is fully initialized.
@@ -116,9 +119,27 @@ void DeviceHub::setProductionCheckInterval(unsigned long intervalMs) {
     }
 }
 
+void DeviceHub::setFirmwareVersion(const char* version) {
+    firmwareVersion = version;
+    log("Firmware version set to: %s", version);
+}
+
+void DeviceHub::setBLEBeacon(uint16_t major, uint16_t minor, int8_t txPower) {
+    bleBeaconMajor = major;
+    bleBeaconMinor = minor;
+    bleBeaconTxPower = txPower;
+    bleBeaconConfigured = true;
+    log("BLE iBeacon configured: Major=%d, Minor=%d, TxPower=%d", major, minor, txPower);
+}
+
 DeviceHub::~DeviceHub() {
     log("Cleaning up DeviceHub...");
-    
+
+    // Stop BLE beacon if active
+    if (bleBeaconActive) {
+        stopBLEBeacon();
+    }
+
     // Stop network task if running
     if (isDualCore && networkTaskRunning) {
         stopNetworkTask();
@@ -232,7 +253,17 @@ void DeviceHub::begin(Print& serial) {
     
     setupCoAPResources();
     ensureDeviceUUID();
-    
+
+    // Register built-in firmware OTA action
+    registerAction("updateFirmware", "Update Firmware", [this](const JsonObject& payload) {
+        String url = payload["url"] | "";
+        if (url.length() == 0) return String("No URL provided");
+        pendingOTAUrl = url;
+        otaUpdatePending = true;
+        log("OTA update queued from URL: %s", url.c_str());
+        return String("Update queued, downloading...");
+    });
+
     // Only start OTA helper if we have WiFi connection (not AP-only mode)
     if (!isAPOnlyMode() && !configuredNetworks.empty() && currentWiFiMode == WiFiMode::Station) {
         log("Starting OTA helper...");
@@ -328,9 +359,16 @@ void DeviceHub::log(const char* format, ...) {
 }
 
 void DeviceHub::loop() {
+    // Check for pending OTA update (deferred so CoAP ACK goes out first)
+    if (otaUpdatePending) {
+        otaUpdatePending = false;
+        performOTAUpdate(pendingOTAUrl.c_str());
+        // performOTAUpdate calls ESP.restart() on success, so we only reach here on failure
+    }
+
     if (isDualCore) {
         // Dual-core mode: lightweight main loop
-        
+
         // Check network task health
         checkNetworkTaskHealth();
         
@@ -617,6 +655,7 @@ String DeviceHub::getDeviceInfo() {
     doc["uuid"] = deviceUUID;
     doc["name"] = deviceName;
     doc["deviceType"] = deviceType;
+    doc["firmwareVersion"] = firmwareVersion;
 
     JsonObject capabilities = doc["capabilities"].to<JsonObject>();
     JsonArray actionsArray = capabilities["actions"].to<JsonArray>();
@@ -2221,5 +2260,148 @@ void DeviceHub::checkForProductionNetwork() {
             }
         }
     }
+}
+
+// =============================================
+// BLE iBeacon Support Methods
+// =============================================
+
+bool DeviceHub::startBLEBeacon() {
+#if defined(ESP32)
+    if (!bleBeaconConfigured) {
+        log("BLE beacon not configured. Call setBLEBeacon() before begin().");
+        return false;
+    }
+
+    if (deviceUUID.length() != 36) {
+        log("Error: Device UUID not available. Call startBLEBeacon() after begin().");
+        return false;
+    }
+
+    if (bleBeaconActive) {
+        log("BLE beacon already active");
+        return true;
+    }
+
+    log("Starting BLE iBeacon (Major=%d, Minor=%d)...", bleBeaconMajor, bleBeaconMinor);
+
+    BLEDevice::init("");
+    configureBLEAdvertising();
+
+    bleBeaconActive = true;
+    log("BLE iBeacon started successfully");
+    return true;
+#else
+    log("BLE iBeacon not supported on this platform");
+    return false;
+#endif
+}
+
+void DeviceHub::stopBLEBeacon() {
+#if defined(ESP32)
+    if (!bleBeaconActive) {
+        return;
+    }
+
+    log("Stopping BLE iBeacon...");
+
+    BLEDevice::getAdvertising()->stop();
+    BLEDevice::deinit(true);
+
+    bleBeaconActive = false;
+    log("BLE iBeacon stopped, memory released");
+#endif
+}
+
+bool DeviceHub::isBLEBeaconActive() const {
+    return bleBeaconActive;
+}
+
+void DeviceHub::configureBLEAdvertising() {
+#if defined(ESP32)
+    BLEBeacon beacon;
+    beacon.setManufacturerId(0x004C);  // Apple's company ID (required for iBeacon)
+    beacon.setProximityUUID(BLEUUID::fromString(deviceUUID.c_str()));
+    beacon.setMajor(bleBeaconMajor);
+    beacon.setMinor(bleBeaconMinor);
+    beacon.setSignalPower(bleBeaconTxPower);
+
+    BLEAdvertisementData advData;
+    advData.setFlags(0x06);  // BR_EDR_NOT_SUPPORTED | LE_GENERAL_DISC
+
+    std::string strServiceData = "";
+    strServiceData += (char)26;    // Length of remaining data
+    strServiceData += (char)0xFF;  // Type: Manufacturer Specific Data
+    strServiceData += beacon.getData();
+    advData.addData(strServiceData);
+
+    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->setAdvertisementData(advData);
+    BLEAdvertisementData emptyScanResponse;
+    pAdvertising->setScanResponseData(emptyScanResponse);
+    pAdvertising->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+    pAdvertising->start();
+
+    log("BLE advertising started: UUID=%s, Major=%d, Minor=%d",
+        deviceUUID.c_str(), bleBeaconMajor, bleBeaconMinor);
+#endif
+}
+
+// =============================================
+// HTTP OTA Update
+// =============================================
+
+bool DeviceHub::performOTAUpdate(const char* url) {
+#if defined(ESP32)
+    log("OTA: Starting HTTP update from %s", url);
+
+    HTTPClient http;
+    http.begin(url);
+    int httpCode = http.GET();
+
+    if (httpCode != HTTP_CODE_OK) {
+        log("OTA: HTTP GET failed, code: %d", httpCode);
+        http.end();
+        return false;
+    }
+
+    int contentLength = http.getSize();
+    if (contentLength <= 0) {
+        log("OTA: Invalid content length: %d", contentLength);
+        http.end();
+        return false;
+    }
+
+    log("OTA: Firmware size: %d bytes", contentLength);
+
+    if (!Update.begin(contentLength, U_FLASH)) {
+        log("OTA: Update.begin() failed: %s", Update.errorString());
+        http.end();
+        return false;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    size_t written = Update.writeStream(*stream);
+    http.end();
+
+    if (written != (size_t)contentLength) {
+        log("OTA: Write mismatch: wrote %d of %d bytes", written, contentLength);
+        Update.abort();
+        return false;
+    }
+
+    if (!Update.end() || !Update.isFinished()) {
+        log("OTA: Update.end() failed: %s", Update.errorString());
+        return false;
+    }
+
+    log("OTA: Update successful! Rebooting...");
+    delay(500);
+    ESP.restart();
+    return true;  // Never reached after restart
+#else
+    log("OTA: HTTP OTA not supported on this platform");
+    return false;
+#endif
 }
 
