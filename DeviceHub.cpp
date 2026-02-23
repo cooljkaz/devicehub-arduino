@@ -177,9 +177,6 @@ void DeviceHub::begin(Print& serial) {
     // Initialize NVS (Non-Volatile Storage) first - this is critical for Preferences
     initializeNVS();
 
-    // Now open Preferences namespace (after NVS is initialized)
-    prefsPtr->begin("devicehub", false);
-
     // Generate AP SSID and mDNS hostname (deferred from constructor for ESP32-S3 compatibility)
     apSSID = generateAPSSID();
     mdnsHostname = generateMDNSHostname();
