@@ -358,6 +358,7 @@ private:
     void handleEmergencyEnd();
   
     bool mdnsRunning = false;
+    bool otaStarted = false;
 
     // New private methods for AP functionality
     bool attemptWiFiConnection();

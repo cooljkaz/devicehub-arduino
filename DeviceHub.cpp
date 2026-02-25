@@ -35,7 +35,7 @@ DeviceHub::DeviceHub(const char* deviceName)
       minSignalStrength(DEFAULT_MIN_SIGNAL_STRENGTH), currentSignalStrength(-100),
       apModeForced(false), totalReconnectionAttempts(0), successfulReconnections(0), openAPMode(DEFAULT_AP_OPEN_NETWORK),
       currentEnvironment(WiFiEnvironment::Unknown), useMultiWiFi(true),
-      productionCheckIntervalMs(300000), lastProductionCheck(0),
+      productionCheckIntervalMs(60000), lastProductionCheck(0),
       forceSingleCore(false), isDualCore(false), detectedCores(1),
       networkTaskHandle(nullptr), commandQueue(nullptr), statusQueue(nullptr), statusMutex(nullptr),
       networkTaskRunning(false), lastNetworkTaskHealthCheck(0),
@@ -205,21 +205,10 @@ void DeviceHub::begin(Print& serial) {
     
     setupCoAPResources();
     ensureDeviceUUID();
-    
-    // Only start OTA helper if we have WiFi connection (not AP-only mode)
-    if (!isAPOnlyMode() && !configuredNetworks.empty() && currentWiFiMode == WiFiMode::Station) {
-        log("Starting OTA helper...");
-        // Use the connected network's credentials for OTA
-        for (const auto& network : configuredNetworks) {
-            if (network.ssid == connectedSSID) {
-                otaHelper.start(network.ssid.c_str(), network.password.c_str(), deviceName, network.password.c_str(), 3232, 115200);
-                break;
-            }
-        }
-    } else {
-        log("Skipping OTA helper (AP-only mode or no WiFi connection)");
-    }
-    
+
+    // OTA initialization moved to loop() for dual-core compatibility
+    // In dual-core mode, WiFi connects asynchronously so we check later
+
     log("DeviceHub initialized successfully");
     
     // Print connection status
@@ -325,6 +314,14 @@ void DeviceHub::loop() {
         
         // Handle other main-core operations
         handleEmergencyPacket();
+
+        // Lazy OTA initialization: start OTA once WiFi is connected
+        if (!otaStarted && !isAPOnlyMode() && !configuredNetworks.empty() && currentWiFiMode == WiFiMode::Station) {
+            log("WiFi connected in dual-core mode, starting OTA helper...");
+            otaHelper.startOtaOnly(deviceName, "44194419", 3232);
+            otaStarted = true;
+        }
+
         otaHelper.handle();
         
     } else {
@@ -380,6 +377,14 @@ void DeviceHub::loop() {
         handleEmergencyPacket();
         resendPendingMessages();
         sendPeriodicUpdate(); // This calls sendDeviceInfo
+
+        // Lazy OTA initialization: start OTA once WiFi is connected
+        if (!otaStarted && !isAPOnlyMode() && !configuredNetworks.empty() && currentWiFiMode == WiFiMode::Station) {
+            log("WiFi connected, starting OTA helper...");
+            otaHelper.startOtaOnly(deviceName, "44194419", 3232);
+            otaStarted = true;
+        }
+
         otaHelper.handle();
     }
 }
@@ -1236,7 +1241,7 @@ void DeviceHub::checkAndReconnect() {
         if (!apModeForced && enableAPFallback) {
             // Attempt to reconnect to WiFi periodically
             static unsigned long lastReconnectAttempt = 0;
-            if (millis() - lastReconnectAttempt > 300000) { // Try every 5 minutes
+            if (millis() - lastReconnectAttempt > 60000) { // Try every 60 seconds
                 lastReconnectAttempt = millis();
                 log("Periodic attempt to reconnect to WiFi from AP mode...");
                 totalReconnectionAttempts++;
@@ -2007,18 +2012,46 @@ bool DeviceHub::attemptMultiWiFiConnection() {
         return false;
     }
 
+    // If we were previously connected to a production network, try it first
+    // with the full timeout before scanning for alternatives
+    if (currentEnvironment == WiFiEnvironment::Production && connectedSSID.length() > 0) {
+        for (const auto& network : configuredNetworks) {
+            if (network.ssid == connectedSSID) {
+                log("Reconnecting to previous production network: %s", network.ssid.c_str());
+                if (tryConnectToNetwork(network, wifiTimeoutMs)) {
+                    log("=== Reconnected to production %s ===", network.ssid.c_str());
+                    log("IP Address: %s", WiFi.localIP().toString().c_str());
+                    log("Signal: %d dBm", WiFi.RSSI());
+                    return true;
+                }
+                log("Production network %s not responding, scanning alternatives...", network.ssid.c_str());
+                break;
+            }
+        }
+    }
+
     // Scan and sort networks by availability and priority
     scanAndSortNetworks();
 
-    // Calculate timeout per network
-    unsigned long perNetworkTimeout = wifiTimeoutMs / configuredNetworks.size();
-    if (perNetworkTimeout < 5000) {
-        perNetworkTimeout = 5000;  // Minimum 5 seconds per network
+    // Give production networks 3x the timeout weight so they get a fair chance
+    int prodCount = 0, devCount = 0;
+    for (const auto& network : configuredNetworks) {
+        if (network.environment == WiFiEnvironment::Production) prodCount++;
+        else devCount++;
     }
+    unsigned long prodTimeout = (prodCount > 0 && devCount > 0)
+        ? (wifiTimeoutMs * 3) / (prodCount * 3 + devCount)
+        : wifiTimeoutMs / configuredNetworks.size();
+    unsigned long devTimeout = (prodCount > 0 && devCount > 0)
+        ? wifiTimeoutMs / (prodCount * 3 + devCount)
+        : prodTimeout;
+    if (prodTimeout < 5000) prodTimeout = 5000;
+    if (devTimeout < 5000) devTimeout = 5000;
 
     // Try each network in order
     for (const auto& network : configuredNetworks) {
-        if (tryConnectToNetwork(network, perNetworkTimeout)) {
+        unsigned long timeout = (network.environment == WiFiEnvironment::Production) ? prodTimeout : devTimeout;
+        if (tryConnectToNetwork(network, timeout)) {
             log("=== Connected to %s ===", network.ssid.c_str());
             log("Environment: %s", getCurrentEnvironmentString().c_str());
             log("IP Address: %s", WiFi.localIP().toString().c_str());
