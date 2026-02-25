@@ -51,6 +51,19 @@ static const uint16_t EMERGENCY_PORT = 8890;
 #include "freertos/semphr.h"
 #endif
 
+// Include BLE headers for iBeacon support (ESP32 only)
+#if defined(ESP32)
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEBeacon.h>
+#endif
+
+// Include HTTP OTA headers (ESP32 only)
+#if defined(ESP32)
+#include <HTTPClient.h>
+#include <Update.h>
+#endif
+
 enum class DeviceState { 
     Normal,
     Emergency,
@@ -81,15 +94,21 @@ struct WiFiNetwork {
 };
 
 struct ActionParameter {
-    String name;
-    String type;
-    String unit;
-    float defaultValue;
-    float min;
-    float max;
+    String name;        // Parameter ID (e.g., "code", "brightness")
+    String type;        // "string", "number", "boolean"
+    String unit;        // Unit label (e.g., "%", "ms") or empty
+    float defaultValue; // Default value for numbers
+    float min;          // Min value for numbers, or min length for strings
+    float max;          // Max value for numbers, or max length for strings
+    String label;       // Human-readable label (e.g., "Enter Code")
+    String description; // Help text (e.g., "4-digit code")
+    String defaultString; // Default value for strings
 };
 
 // Inter-core communication structures
+// NOTE: Do NOT use String, JsonDocument, or other objects with internal heap pointers here!
+// FreeRTOS queues use memcpy which breaks objects with dynamic memory.
+// Use fixed-size char arrays instead.
 struct NetworkCommand {
     enum Type {
         WIFI_RECONNECT,
@@ -100,8 +119,7 @@ struct NetworkCommand {
         CHECK_CONNECTION
     };
     Type type;
-    String data;
-    JsonDocument payload;
+    char data[64];  // Fixed-size buffer instead of String
 };
 
 struct NetworkStatus {
@@ -109,7 +127,7 @@ struct NetworkStatus {
     bool connected;
     int signalStrength;
     IPAddress currentIP;
-    String lastError;
+    char lastError[64];  // Fixed-size buffer instead of String
     unsigned long lastUpdate;
     bool isAPMode;
 };
@@ -129,7 +147,7 @@ public:
     struct Event {
         String id;
         String name;
-        JsonObject dataSchema;
+        String dataSchemaJson;  // Serialized JSON string (stores a copy, not a reference)
     };
 
     struct Setting {
@@ -167,6 +185,8 @@ public:
     void setWiFiTimeout(int timeoutMs);             // Default: 20000ms
     void setForceSingleCore(bool force);            // Default: false (auto-detect)
     void setProductionCheckInterval(unsigned long intervalMs);  // Default: 300000ms (5 min)
+    void setBLEBeacon(uint16_t major, uint16_t minor, int8_t txPower = -59);  // Configure iBeacon (call before begin())
+    void setFirmwareVersion(const char* version);   // Set firmware version string (call before begin())
     void begin();
     void begin(Print& serial);
     void loop();
@@ -252,6 +272,11 @@ public:
     int getCoreCount() const;                 // Returns detected core count
     bool isNetworkTaskRunning() const;        // Returns true if network task is active
 
+    // BLE iBeacon control (call after begin())
+    bool startBLEBeacon();              // Start advertising; returns false if not configured
+    void stopBLEBeacon();               // Stop advertising and release BLE memory
+    bool isBLEBeaconActive() const;     // Returns true if beacon is currently advertising
+
     // Multi-WiFi methods
     void addNetwork(const String& ssid, const String& password,
                     WiFiEnvironment env = WiFiEnvironment::Production, int priority = 99);
@@ -335,6 +360,18 @@ private:
     volatile bool cachedIsAPMode;
     IPAddress cachedIP;
 
+    // BLE iBeacon support members
+    bool bleBeaconConfigured;
+    bool bleBeaconActive;
+    uint16_t bleBeaconMajor;
+    uint16_t bleBeaconMinor;
+    int8_t bleBeaconTxPower;
+
+    // Firmware version & OTA members
+    const char* firmwareVersion;
+    String pendingOTAUrl;
+    bool otaUpdatePending;
+
     void ensureDeviceUUID();
     void generateAndStoreUUID();
     bool isUUIDValid();
@@ -358,12 +395,14 @@ private:
     void handleEmergencyEnd();
   
     bool mdnsRunning = false;
-    bool otaStarted = false;
+    bool emergencyUdpInitialized = false;  // Track if UDP socket has been initialized
+    bool otaStarted = false;               // Track if OTA has been initialized
 
     // New private methods for AP functionality
     bool attemptWiFiConnection();
     void setupAccessPoint();
     void setupStationMode();
+    void initializeUdpSockets();  // Initialize UDP sockets after TCP/IP stack is ready
     void setupMDNS();
     void checkAndReconnect();
     String generateAPSSID() const;
@@ -400,6 +439,12 @@ private:
     
     // NVS initialization (handles ESP32 Non-Volatile Storage setup)
     void initializeNVS();
+
+    // BLE iBeacon helper
+    void configureBLEAdvertising();
+
+    // HTTP OTA helper
+    bool performOTAUpdate(const char* url);
 
 };
 
